@@ -3255,6 +3255,13 @@ static bool mul_mat_vec_q_fq_try(
             ne10 % QK8_1 == 0 && (ne10 / QK8_1) * sizeof(block_q8_1) <= 16384)) {
         return false;
     }
+    // Rows longer than 4096: quantize_q8_1 + mul_mat_vec_q stream the weights faster than this kernel (one row per wave
+    // of a 16-wave block) and the extra launch is small against the matvec. Plain tg64, Q8_0, q8_0 KV: Qwen3.8 27B
+    // (K 5120 / 6144) 7.69 -> 7.96 t/s, Muse-Glimmer 30B (K 6656) 7.59 -> 7.69; Qwen3.6 35B-A3B keeps this kernel
+    // (with K = 4096 also on the plain path: 55.4 -> 55.1). Same outputs either way. Expert matvecs (ids) stay here.
+    if (!ids && ne00 > 4096) {
+        return false;
+    }
     if (!launch) {
         return true;
     }
