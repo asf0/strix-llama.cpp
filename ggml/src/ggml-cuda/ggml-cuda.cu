@@ -3584,6 +3584,9 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     // at the logical ops (in particular idx[10] is still the gated delta net).
     int qk_mode = -1; // -1: undecided, 0: L2_NORM, 1: RMS_NORM + SCALE
     const ggml_tensor * qk_scale[2] = { nullptr, nullptr };
+    const ggml_tensor * rs_zero = nullptr; // in-place recurrent state: SCALE(view, 0) at position 1 instead of GET_ROWS
+    bool direct_state = false;             // in-place recurrent state (with or without the SCALE)
+
     for (int j = node_idx + 1; j < cgraph->n_nodes && found < n_ops; ) {
         const ggml_tensor * t = cgraph->nodes[j];
         if (ggml_cuda_is_view_or_noop(t)) {
@@ -3600,6 +3603,26 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
             conv_cpy[n_conv_cpy++] = t;
             last = j++;
             continue;
+        }
+        // in-place recurrent state (no GET_ROWS gather): the gated delta net reads its state straight from the cache.
+        // A cleared slot is zeroed first by SCALE(view, 0) (empty, i.e. a no-op, when no slot is cleared); the launcher
+        // runs it before the fused step.
+        if (found == 1 && t->op == GGML_OP_SCALE && !rs_zero && ggml_get_op_params_f32(t, 0) == 0.0f &&
+                ggml_get_op_params_f32(t, 1) == 0.0f && t->view_src && t->src[0] && t->src[0]->view_src == t->view_src) {
+            rs_zero      = t;
+            direct_state = true;
+            n[found]     = nullptr;
+            idx[found]   = j;
+            last         = j;
+            ++found;
+            ++j;
+            continue;
+        }
+        if (found == 1 && t->op == GGML_OP_SSM_CONV) {
+            direct_state = true;
+            n[found]     = nullptr;
+            idx[found]   = -1;
+            ++found; // t is matched as the SSM_CONV below
         }
         if (found == 4 || found == 5) {
             const int iqk = found - 4;
@@ -3655,7 +3678,7 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
         return 0;
     }
     for (int k = 0; k < n_ops; ++k) {
-        if (k != 0 && k != 11 && k != 13 && (n[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        if (k != 0 && k != 11 && k != 13 && n[k] && (n[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }
     }
@@ -3774,11 +3797,20 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     // gated_delta_net(q, k, v, gate, beta, state) with the state gathered from the cache by get_rows
     if (gdn->src[0] != qk_out[0] || gdn->src[1] != qk_out[1] ||
         !is_view_of(gdn->src[3], mul_a, 0) || !is_view_of(gdn->src[4], sigmoid, 0) ||
-        gdn->src[3]->ne[0] != 1 || ggml_nelements(gdn->src[3]) != H_v * n_tokens || ggml_nelements(gdn->src[4]) != H_v * n_tokens ||
-        !is_view_of(gdn->src[5], get_rows, 0) || ggml_nelements(get_rows) != S * S * H_v) {
+        gdn->src[3]->ne[0] != 1 || ggml_nelements(gdn->src[3]) != H_v * n_tokens || ggml_nelements(gdn->src[4]) != H_v * n_tokens) {
         return 0;
     }
-    {
+    if (direct_state) {
+        // the state of the sequence, read in place from the recurrent cache
+        const ggml_tensor * st = gdn->src[5];
+        if (!st->view_src || (rs_zero && st->view_src != rs_zero->view_src) || st->type != GGML_TYPE_F32 ||
+            ggml_nelements(st) != S * S * H_v || !ggml_is_contiguous(st) || K != 1) {
+            return 0;
+        }
+    } else if (!is_view_of(gdn->src[5], get_rows, 0) || ggml_nelements(get_rows) != S * S * H_v) {
+        return 0;
+    }
+    if (!direct_state) {
         const ggml_tensor * cache = get_rows->src[0];
         const ggml_tensor * ids   = get_rows->src[1];
         if (cache->type != GGML_TYPE_F32 || cache->ne[0] != S * S * H_v || cache->nb[0] != sizeof(float) ||
@@ -3849,9 +3881,17 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
         args.qk_scale_add[0] = ggml_get_op_params_f32(qk_scale[0], 1);
         args.qk_scale_add[1] = ggml_get_op_params_f32(qk_scale[1], 1);
     }
-    args.state_cache    = (const float *) get_rows->src[0]->data;
-    args.state_ids      = (const int32_t *) get_rows->src[1]->data;
-    args.state_row_stride = get_rows->src[0]->nb[1] / sizeof(float);
+    if (direct_state) {
+        args.state_cache      = (const float *) gdn->src[5]->data;
+        args.state_ids        = nullptr;
+        args.state_row_stride = 0;
+        args.rs_zero          = rs_zero;
+
+    } else {
+        args.state_cache      = (const float *) get_rows->src[0]->data;
+        args.state_ids        = (const int32_t *) get_rows->src[1]->data;
+        args.state_row_stride = get_rows->src[0]->nb[1] / sizeof(float);
+    }
     args.state_out      = state_cpy.data;
     args.scale          = 1.0f / sqrtf((float) S);
     args.norm_w         = (const float *) mul_w->src[1]->data;
@@ -5072,7 +5112,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 uint16_t * dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, j + sk, m.dst);
                 // every reader takes the BF16 copy: skip the F32 store
                 float * dst32 = (dst16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, m.dst)) ? nullptr : (float *) m.dst->data;
-                ggml_cuda_gdn_set_out_norm(node, (const float *) m.w->data, (const float *) m.z->data, dst32, dst16, m.eps);
+                ggml_cuda_gdn_set_out_norm(node, (const float *) m.w->data, (const float *) m.z->data, dst32, dst16, m.eps, m.silu);
                 s_precomputed[r] = sk;
             }
             break;
@@ -5353,6 +5393,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_gdn_decode_args args;
         const int nodes_to_skip = ggml_cuda_try_gdn_decode_fusion(cgraph, i, args);
         if (nodes_to_skip > 0) {
+            // in-place recurrent state: zero the cleared slot before the fused step reads the state
+            if (args.rs_zero && !ggml_is_empty(args.rs_zero) && !ggml_cuda_compute_forward(*cuda_ctx, const_cast<ggml_tensor *>(args.rs_zero))) {
+                GGML_ABORT("gdn decode: recurrent state zeroing failed");
+            }
+
             // qwen4exp: the gated norm output only feeds sigmoid(z) * . -> ssm_out matvec. Apply the norm and the
             // gate in the prologue of the fused-quantize matvec instead of two more kernels.
             {
@@ -5396,9 +5441,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_mul_mat_vec_q_fq_gdn_gate(*cuda_ctx, mm, attn.get(), sig->src[0], args.norm_w_tensor, args.eps_rms);
                     return mm_idx - i;
                 }
-                // otherwise the norm kernel of the fused step also applies the sigmoid(z) gate (one launch less)
-                if (getenv("GGML_CUDA_DISABLE_GDN_NORMGATE") == nullptr && sig && mul &&
-                        sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && mul->op == GGML_OP_MUL &&
+                // otherwise the norm kernel of the fused step also applies the sigmoid(z) or silu(z) gate (one launch less)
+                if (getenv("GGML_CUDA_DISABLE_GDN_NORMGATE") == nullptr && sig && mul && sig->op == GGML_OP_UNARY &&
+                        (ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(sig) == GGML_UNARY_OP_SILU) && mul->op == GGML_OP_MUL &&
                         ((mul->src[0] == sig && mul->src[1] == norm_out) || (mul->src[1] == sig && mul->src[0] == norm_out)) &&
                         sig->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
                         sig->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(sig->src[0]) &&
@@ -5408,7 +5453,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         ggml_node_get_use_count(cgraph, norm_idx) == 1 && ggml_node_get_use_count(cgraph, sig_idx) == 1 &&
                         (norm_out->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
                     // z and the gated output are read/written element for element by the same thread: in-place is fine
-                    ggml_cuda_op_gdn_decode_fused_gated(*cuda_ctx, args, (const float *) sig->src[0]->data, (float *) mul->data);
+                    ggml_cuda_op_gdn_decode_fused_gated(*cuda_ctx, args, (const float *) sig->src[0]->data, (float *) mul->data,
+                        ggml_get_unary_op(sig) == GGML_UNARY_OP_SILU);
                     return mul_idx - i;
                 }
             }
@@ -7177,6 +7223,82 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (!indep) continue;
             std::rotate(cgraph->nodes + i, cgraph->nodes + i + cnt, cgraph->nodes + k);   // [between][reduction] SIGMOID MUL ADD
             i = k + 2;
+        }
+    }
+    // Single-token GDN step (the fused decode kernel matches CONCAT ... GATED_DELTA_NET with the gate / beta inputs already
+    // computed): dense qwen35 schedules the alpha and beta projections inside that chain, right before ADD(dt_bias) and
+    // SIGMOID. Move each of them to just before the conv CONCAT when it reads nothing produced from there on. Before
+    // allocation, so both outputs stay alive until the step consumes them.
+    if (GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[cuda_ctx->device].cc) && getenv("GGML_CUDA_DISABLE_GDN_HOIST") == nullptr) {
+        auto root  = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        auto index = [&](const ggml_tensor * t) { for (int k = 0; k < cgraph->n_nodes; ++k) if (cgraph->nodes[k] == t) return k; return -1; };
+        for (int ig = 0; ig < cgraph->n_nodes; ++ig) {
+            const ggml_tensor * gdn = cgraph->nodes[ig];
+            if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[2] > 8) continue;   // decode / verify steps only
+            // conv CONCAT: v (src[2]) is a view of SILU(SSM_CONV(CONCAT, w))
+            const ggml_tensor * silu = root(gdn->src[2]);
+            if (silu->op != GGML_OP_UNARY || !silu->src[0] || silu->src[0]->op != GGML_OP_SSM_CONV) continue;
+            const ggml_tensor * concat = silu->src[0]->src[0];
+            if (!concat || concat->op != GGML_OP_CONCAT) continue;
+            const int ic = index(concat);
+            if (ic < 0 || ic > ig) continue;
+            // alpha: src[3] = view of MUL(SOFTPLUS(ADD(view of MUL_MAT, dt_bias)), a); beta: src[4] = view of SIGMOID(view of MUL_MAT)
+            const ggml_tensor * mms[2] = { nullptr, nullptr };
+            const ggml_tensor * g = root(gdn->src[3]);
+            if (g->op == GGML_OP_MUL && g->src[0] && g->src[0]->op == GGML_OP_UNARY && g->src[0]->src[0] && g->src[0]->src[0]->op == GGML_OP_ADD) {
+                const ggml_tensor * add = g->src[0]->src[0];
+                for (int s = 0; s < 2; ++s) if (add->src[s] && root(add->src[s])->op == GGML_OP_MUL_MAT) mms[0] = root(add->src[s]);
+            }
+            const ggml_tensor * b = root(gdn->src[4]);
+            if (b->op == GGML_OP_UNARY && b->src[0] && root(b->src[0])->op == GGML_OP_MUL_MAT) mms[1] = root(b->src[0]);
+            int at = ic;
+            for (const ggml_tensor * mm : mms) {
+                if (!mm) continue;
+                const int im = index(mm);
+                if (im <= at) continue;
+                bool indep = true;
+                for (int n = at; n < im && indep; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    for (int s = 0; s < GGML_MAX_SRC && mm->src[s] && indep; ++s) {
+                        indep = mm->src[s] != t && root(mm->src[s]) != t && root(mm->src[s]) != root(t);
+                    }
+                }
+                if (!indep) continue;
+                std::rotate(cgraph->nodes + at, cgraph->nodes + im, cgraph->nodes + im + 1);   // MUL_MAT CONCAT ...
+                ++at;
+            }
+        }
+    }
+    // Chunked GDN prefill whose gated output norm takes a gate z projected only after the scan (Qwen3.5/3.6/3.8 build
+    // RMS_NORM -> MUL(w) -> MUL_MAT(z) -> SILU(z) -> MUL): move that MUL_MAT to just before the GDN node, so the scan
+    // epilogue can apply norm and gate (GGML_OP_GATED_DELTA_NET in the fusion pass) and the scan output never round-trips
+    // through memory. Only when the MUL_MAT reads nothing produced from the GDN node on. Runs before allocation, so z is
+    // kept alive across the scan. GGML_CUDA_DISABLE_GDN_OUTNORM=1 keeps the original order.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && getenv("GGML_CUDA_DISABLE_GDN_OUTNORM") == nullptr) {
+        auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * gdn = cgraph->nodes[i];
+            if (gdn->op != GGML_OP_GATED_DELTA_NET || !ggml_cuda_gdn_chunk_eligible_node(gdn)) continue;
+            for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; ++j) {
+                const ggml_tensor * r = cgraph->nodes[j];
+                if (r->op != GGML_OP_RMS_NORM) continue;
+                if (!(r->src[0] && r->src[0]->view_src == gdn && r->src[0]->view_offs == 0)) break;
+                ggml_cuda_norm_gated_match m;
+                if (ggml_cuda_norm_gated_match_at(cgraph, j, m) <= 0 || m.pre < 0 || !m.silu) break;
+                const ggml_tensor * mm = cgraph->nodes[m.pre];
+                bool indep = true;
+                for (int n = i; n < m.pre && indep; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    for (int s = 0; s < GGML_MAX_SRC && mm->src[s] && indep; ++s) {
+                        indep = mm->src[s] != t && root(mm->src[s]) != t && root(mm->src[s]) != root(t);
+                    }
+                }
+                if (indep) {
+                    std::rotate(cgraph->nodes + i, cgraph->nodes + m.pre, cgraph->nodes + m.pre + 1);   // MUL_MAT(z) GDN ...
+                    ++i;
+                }
+                break;
+            }
         }
     }
     {   // HC16: mark tensors whose readers all take the BF16 copy, so their producers skip the F32 store
