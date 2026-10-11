@@ -4,7 +4,9 @@
 // Off unless the backend context opts in (ggml_backend_cuda_set_mmb_enabled).
 bool ggml_cuda_mmb_supported_mm  (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
-void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const float * R = nullptr);
+// the dense GEMM can add a residual R (dst = src0 x src1 + R) in its epilogue
+bool ggml_cuda_mmb_add_fusable(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 // qwen4exp QSA indexer scorer: F32 GEMM + relu + 4-head sum (+ compact visibility) in one kernel, dst [M, T/4]
 bool ggml_cuda_mmb_idx_score_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * mm, int heads);
