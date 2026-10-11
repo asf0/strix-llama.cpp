@@ -4939,6 +4939,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // residual ADD after a dense mmb GEMM (attention / GDN output projection): MUL_MAT [-> RESHAPE] -> ADD(., r), the
+    // product used only there -> the GEMM epilogue adds r and writes the ADD's output (the same F32 addition)
+    static const bool mmb_add = getenv("GGML_CUDA_DISABLE_MMB_ADD") == nullptr;
+    if (mmb_add && node->op == GGML_OP_MUL_MAT && node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->src[2] == nullptr &&
+            ggml_is_quantized(node->src[0]->type) && node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3] >= 512 &&
+            (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_node_has_n_uses(cgraph, i, 1) &&
+            ggml_cuda_mmb_supported_mm(*cuda_ctx, node->src[0], node->src[1], node) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node)) {
+        int j = i + 1;
+        const ggml_tensor * cur = node;
+        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RESHAPE && cgraph->nodes[j]->src[0] == node &&
+                (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            // views carry no use count: the reshape must be read by the ADD right after it only
+            const ggml_tensor * rs = cgraph->nodes[j];
+            int n_readers = 0;
+            for (int k = j + 1; k < cgraph->n_nodes && n_readers < 2; ++k) {
+                for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+                    if (cgraph->nodes[k]->src[sidx] == rs || cgraph->nodes[k]->view_src == rs) { ++n_readers; break; }
+                }
+            }
+            cur = n_readers == 1 ? cgraph->nodes[j++] : nullptr;
+        }
+        ggml_tensor * add = cur && j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+        const ggml_tensor * r = !add || add->op != GGML_OP_ADD ? nullptr :
+            add->src[0] == cur ? add->src[1] : (add->src[1] == cur ? add->src[0] : nullptr);
+        auto disjoint = [&](const ggml_tensor * t) {
+            const uintptr_t a0 = (uintptr_t) t->data, a1 = a0 + ggml_nbytes(t), b0 = (uintptr_t) add->data, b1 = b0 + ggml_nbytes(add);
+            return !(a0 < b1 && b0 < a1);
+        };
+        if (r && r != cur && add->type == GGML_TYPE_F32 && r->type == GGML_TYPE_F32 && ggml_is_contiguous(add) && ggml_is_contiguous(r) &&
+                ggml_are_same_shape(add, cur) && ggml_are_same_shape(r, cur) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, add) &&
+                ggml_cuda_mmb_add_fusable(*cuda_ctx, node->src[0], node->src[1], add) &&
+                disjoint(node->src[0]) && disjoint(node->src[1]) && (disjoint(r) || (r->data == add->data && ggml_are_same_layout(r, add)))) {
+            ggml_cuda_mul_mat_mmb(*cuda_ctx, node->src[0], node->src[1], add, (const float *) r->data);
+            return j - i;
+        }
+    }
+
     // prefill shared-expert merge: SIGMOID(gate [1, T]) -> MUL(shexp [n, T], gate) -> ADD(moe_out, .) in one kernel
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes &&
             node->type == GGML_TYPE_F32 && node->ne[0] == 1 && ggml_nrows(node) >= 2 && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr) {
@@ -6391,7 +6428,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        // the BF16 copy for an MMB GEMM reading the result next is written by the norm, not converted afterwards
+        // Not when the next reader is an F32-weight GEMM (the MoE router reads the F32 result first): the extra BF16 write
+        // pushes its input out of the MALL and the router loses what the conversion saves.
+        int k_next = i + 2;
+        while (k_next < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k_next])) {
+            k_next++;
+        }
+        const bool f32_reader = k_next < cgraph->n_nodes && cgraph->nodes[k_next]->op == GGML_OP_MUL_MAT &&
+            cgraph->nodes[k_next]->src[0]->type == GGML_TYPE_F32;
+        uint16_t * dst16 = f32_reader || ggml_cuda_mmb_is_bf16_only(*cuda_ctx, cgraph->nodes[i + 1]) ? nullptr :
+            ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 1, cgraph->nodes[i + 1]);
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], dst16);
         return 1;
     }
 
@@ -7314,7 +7362,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, t)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, t);
             }
-            if (ggml_cuda_mmb_down16()) {   // IQ4_NL routed down GEMM read only by the weighted reduction keeps BF16 outputs
+            if (ggml_cuda_mmb_down16()) {   // a routed down GEMM read only by the weighted reduction keeps 16-bit outputs
+                // BF16 halves the write of the down GEMM and the read of the reduction (8 rows per token). Qwen3.6 35B-A3B
+                // Q8_0 KLD vs F32 0.0022, the same as F16 outputs vs F32 or vs BF16 (0.0021): expert selection flips at
+                // that level for any change in rounding. GGML_CUDA_MMB_DOWN_F32=1 keeps F32 outputs except for IQ4_NL.
+                static const bool down_f32 = getenv("GGML_CUDA_MMB_DOWN_F32") != nullptr && atoi(getenv("GGML_CUDA_MMB_DOWN_F32")) != 0;
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
                     ggml_cuda_moe_weighted_reduction_match match;
                     if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) continue;
@@ -7323,7 +7375,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     for (int k = 0; k < i; ++k) { if (cgraph->nodes[k] == ex) { xi = k; break; } }
                     if (xi < 0 || ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32) continue;
                     if (!ggml_cuda_mmb_supported_mmid(*cuda_ctx, ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
-                    if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;   // other formats keep F32 expert outputs
+                    if (down_f32 && ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;
                     if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
                     if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
                     if (ggml_cuda_marks_readers_local(cgraph, ex)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, ex);
