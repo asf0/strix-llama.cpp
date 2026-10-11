@@ -316,6 +316,78 @@ struct case_rollback : ctx_test {
     }
 };
 
+// a verification batch of n_rs_seq + 1 tokens that is as wide as the 256-token snapshot cutoff of qwen35 / qwen35moe
+// (n_rs_seq = 255) must keep its rollback snapshots: roll back its last tokens and replay them, compared against a
+// reference context that never decoded the rolled-back tokens
+struct case_rollback_wide_verify : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "wide"; }
+
+    const char * description() const override {
+        return "a verification batch of n_rs_seq + 1 = 256 tokens keeps its snapshots for the rollback";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t n_rs_seq   = 255;
+        constexpr uint32_t n_tokens   = n_rs_seq + 1;
+        constexpr uint32_t n_rollback = 3;
+        constexpr llama_pos p0        = n_tokens - n_rollback;
+
+        ctx_opts opts;
+        opts.n_ctx     = 1024;
+        opts.n_batch   = 512;
+        opts.n_ubatch  = n_tokens + 1; // the split keeps the last n_rs_seq + 1 tokens of a seq in one ubatch and needs one more
+        opts.n_seq_max = 1;
+        opts.n_rs_seq  = n_rs_seq;
+
+        llama_context_ptr ctx_roll = mr.ctx(opts);
+        llama_context_ptr ctx_ref  = mr.ctx(opts);
+        if (!ctx_roll || !ctx_ref) {
+            return case_result::fail();
+        }
+
+        if (llama_n_rs_seq(ctx_roll.get()) < n_rs_seq) {
+            return case_result::skip("n_rs_seq is too small");
+        }
+
+        CTX_REQUIRE(decode_gen(ctx_roll.get(), n_vocab, 0, 0, (llama_pos) n_tokens) &&
+                    decode_gen(ctx_ref.get(),  n_vocab, 0, 0, p0),
+                "the prompt decode failed");
+
+        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), 0, p0, -1),
+                "the rollback after the verification batch was refused");
+
+        logits_diff diff;
+        for (uint32_t i = 0; i < n_rollback; ++i) {
+            const llama_pos pos = p0 + (llama_pos) i;
+            const llama_token tok = gen_token(n_vocab, 0, pos);
+            CTX_REQUIRE(decode_one(ctx_roll.get(), tok, pos) && decode_one(ctx_ref.get(), tok, pos),
+                    "the replay failed at position " + std::to_string(pos));
+
+            const float * l_roll = llama_get_logits_ith(ctx_roll.get(), 0);
+            const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
+            CTX_REQUIRE(l_roll != nullptr && l_ref != nullptr, "missing replay logits at position " + std::to_string(pos));
+
+            diff.add(l_roll, l_ref, n_vocab);
+        }
+
+        // the batches differ in width (and so in the GDN kernel), random dummy models drift up to ~1.7e-5
+        constexpr float nmse_eps = 1e-4f;
+
+        CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                "replay logits after the rollback mismatch (max diff " + std::to_string(diff.diff_max) +
+                ", nmse " + std::to_string(diff.nmse()) + ")");
+
+        TLOG_INF("%s: rollback after a %u-token verification batch matched (max diff %g, nmse %g)\n",
+                __func__, n_tokens, (double) diff.diff_max, diff.nmse());
+
+        return case_result::pass();
+    }
+};
+
 // decode a prompt into seq 0, share its cells with a second sequence, then keep decoding both
 struct case_shared_seq_reserve : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
@@ -398,6 +470,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
+    cases.push_back(std::make_unique<case_rollback_wide_verify>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
     return cases;
