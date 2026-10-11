@@ -19,8 +19,9 @@ void ggml_cuda_gdn_set_qk_norm(const ggml_tensor * gdn, const ggml_tensor * q_ra
 // straight into out (+ optional BF16 copy out16); z / out laid out like the GDN output rows [S_v, H, T]
 // out16_f16: out16 holds F16 (saturating) instead of BF16, for an MMB_DENSE_F16 reader
 // z_bf16: z holds BF16 (the z GEMM stored only the BF16 copy, see ggml_cuda_gdn_z16_ok)
+// silu: the gate is silu(z) (Qwen3.5/3.6/3.8) instead of sigmoid(z); the v2 scan takes only sigmoid
 void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps,
-        bool out16_f16 = false, bool z_bf16 = false);
+        bool out16_f16 = false, bool z_bf16 = false, bool silu = false);
 // graph-time predicate: the z GEMM feeding the gated output norm of this GDN node may store BF16 only
 bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn);
 // chunked prefill: the causal conv + SiLU producing q/k/v is computed by the chunk kernels from the raw conv input
@@ -58,7 +59,7 @@ struct ggml_cuda_gdn_decode_args {
     // recurrence
     const float *   state_cache;      // [S*S*H_v, n_slots] cache, row = state_ids[0] (transposed per head: [col][row])
     const int32_t * state_ids;
-    int64_t         state_row_stride;
+    int64_t         state_row_stride; // 0: state_cache points at the state itself (in-place recurrent state), ids unused
     float *       state_out;      // [S, S, H_v] cache row
     float         scale;          // 1/sqrt(S)
     // gated rms norm
@@ -72,11 +73,12 @@ struct ggml_cuda_gdn_decode_args {
     int64_t       qkv_token_stride = 0;
     int64_t       conv_slot_stride = 0;
     int64_t       state_slot_stride = 0;
+    const ggml_tensor * rs_zero = nullptr; // host only: recurrent-state zeroing node the launcher runs first
 };
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);
 // same, with the following sigmoid(z) * norm applied by the norm kernel, which then writes gated_out instead of args.out
 void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args,
-        const float * z, float * gated_out);
+        const float * z, float * gated_out, bool silu);
 // first kernel only: writes the pre-norm attention output [S, H_v] to attn_scratch (the gated norm is applied by the consumer)
 void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args, float * attn_scratch);
