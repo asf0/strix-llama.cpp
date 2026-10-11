@@ -445,6 +445,22 @@ static __device__ void no_device_code(
 #define NO_DEVICE_CODE //GGML_ABORT("NO_DEVICE_CODE not valid in host code.")
 #endif // __CUDA_ARCH__
 
+#if defined(GGML_USE_HIP)
+// Workgroup barrier that only orders LDS: __syncthreads() also waits for all outstanding global loads (vmcnt(0)) and
+// invalidates the vector L0 cache. The 3-argument fence with an address-space operand is not accepted by older clang
+// (clang 17 / ROCm 6.1 reject it with "too many arguments"); the lower bound below is conservative, older compilers
+// fall back to the full barrier.
+static __device__ __forceinline__ void ggml_cuda_lds_barrier() {
+#if defined(__clang__) && __clang_major__ >= 20
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif // defined(__clang__) && __clang_major__ >= 20
+}
+#endif // defined(GGML_USE_HIP)
+
 // The compiler is always able to unroll loops if they contain continue expressions.
 // In such cases loop unrolling can still be achieved via recursion:
 template <int n>
@@ -1511,6 +1527,17 @@ struct ggml_backend_cuda_context {
     std::vector<uint64_t> mmb_graph_sigs;
     // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
     std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
+
+    // RDNA3.5 FA: KV_max and the mask classes of a KQ mask are the same for every attention layer of a graph compute
+    // that reads it (the mask is written between computes only) -> computed once per compute_epoch and mask
+    uint64_t compute_epoch = 0;
+    struct fattn_mask_info {
+        uint64_t epoch = 0;
+        int64_t  key[9] = {};
+        void *   buf  = nullptr;
+        size_t   size = 0;
+    };
+    fattn_mask_info fattn_masks[4];
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
