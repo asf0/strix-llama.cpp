@@ -7017,8 +7017,14 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
         graph->disable_due_to_gpu_arch = true;
     }
 
+    // RDNA3.5: replaying a graph is no faster than launching its kernels (Qwen3.6 35B-A3B tg 55.5 t/s without, 54.6
+    // with), and speculative decoding changes the batch every round, so graphs are captured and instantiated over and
+    // over: Qwen3.6 + DFlash 66.1 vs 61.4 t/s, Gemma 4 26B + DFlash 40.3 vs 39.0. GGML_CUDA_ENABLE_GRAPHS=1 keeps them.
+    static const bool enable_graphs_env = getenv("GGML_CUDA_ENABLE_GRAPHS") != nullptr && atoi(getenv("GGML_CUDA_ENABLE_GRAPHS")) != 0;
+
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (cc < GGML_CUDA_CC_VOLTA || (GGML_CUDA_CC_IS_RDNA3_5(cc) && !enable_graphs_env)) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
