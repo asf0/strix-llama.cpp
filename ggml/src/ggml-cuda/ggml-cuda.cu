@@ -5215,6 +5215,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_tensor * sig = cgraph->nodes[i + count], * mul = cgraph->nodes[i + count + 1], * add = cgraph->nodes[i + count + 2];
                 if (ggml_cuda_moe_sgma_tail(match, sig, mul, add) &&
                         ggml_node_has_n_uses(cgraph, i + count, 1) && ggml_node_has_n_uses(cgraph, i + count + 1, 1)) {
+                    // the residual ADD after the FFN, when the merged sum is used only there: written by the same kernel
+                    const int nres = i + count + 3;
+                    if (nres < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + count + 2, 1) && (add->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                        ggml_tensor * radd = cgraph->nodes[nres];
+                        const ggml_tensor * r = radd->op != GGML_OP_ADD ? nullptr :
+                            radd->src[0] == add ? radd->src[1] : (radd->src[1] == add ? radd->src[0] : nullptr);
+                        if (r && r != add && radd->type == GGML_TYPE_F32 && ggml_is_contiguous(radd) && ggml_are_same_shape(radd, add) &&
+                                ggml_are_same_shape(r, add) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, radd) &&
+                                ggml_cuda_check_fusion_memory_ranges(cgraph, i, count + 4, &nres, 1) &&
+                                ggml_cuda_op_moe_weighted_reduction_sgma(*cuda_ctx, match.experts, match.expert_scale, match.weights,
+                                                                         sig->src[0], mul->src[0], radd, r)) {
+                            return count + 3;
+                        }
+                    }
                     const int out_idx = i + count + 2;
                     if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count + 3, &out_idx, 1) &&
                             ggml_cuda_op_moe_weighted_reduction_sgma(*cuda_ctx, match.experts, match.expert_scale, match.weights,
