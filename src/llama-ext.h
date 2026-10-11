@@ -136,6 +136,20 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Keep the extracted layer inputs in device memory instead of copying them to the host, so that a
+// context that has this one as ctx_other can read them in place (llama_set_layer_inp_row).
+// llama_get_embeddings_layer_inp() is not available while this is enabled.
+LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
+
+// row >= 0: the following decodes of ctx take their input features from the device layer inputs of
+// ctx_other, starting at this row of the last ctx_other batch, instead of from the batch embeddings.
+// The batch must hold a single sequence. -1 restores the default.
+LLAMA_API void llama_set_layer_inp_row(struct llama_context * ctx, int32_t row);
+
+// true when ctx can read the device layer inputs of its ctx_other in place: one of its backends takes the buffer
+// of the device that holds them. Call it after the layers to extract are set on ctx_other.
+LLAMA_API bool llama_can_read_layer_inp_dev(struct llama_context * ctx);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
