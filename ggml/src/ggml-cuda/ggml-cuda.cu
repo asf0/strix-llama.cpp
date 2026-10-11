@@ -786,6 +786,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_mmb_release_all(*this);
     }
 
+    ggml_cuda_set_device(device);
+    for (auto & m : fattn_masks) {
+        if (m.buf != nullptr) {
+            CUDA_CHECK(cudaFree(m.buf)); // synchronizes with the device
+        }
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -6921,6 +6928,7 @@ static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->compute_epoch++;
     if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
         const uint64_t sig = ggml_cuda_graph_sig(cgraph);
         if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
