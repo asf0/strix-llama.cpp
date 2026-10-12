@@ -6449,6 +6449,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // single-column MUL_MAT -> RESHAPE -> ADD (the residual ADD after the GDN output projection of qwen35/qwen35moe): the
+    // reshape is a no-op on a contiguous vector, so the ADD's other operand is the matvec's bias (same F32 addition)
+    if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE &&
+            cgraph->nodes[i + 1]->src[0] == node && cgraph->nodes[i + 2]->op == GGML_OP_ADD && ggml_node_has_n_uses(cgraph, i, 1) &&
+            (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+        ggml_tensor * rs  = cgraph->nodes[i + 1];
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * bias = add->src[0] == rs ? add->src[1] : (add->src[1] == rs ? add->src[0] : nullptr);
+        int n_readers = 0; // views carry no use count: the reshape must be read by the ADD only
+        for (int k = i + 2; k < cgraph->n_nodes && n_readers < 2; ++k) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (cgraph->nodes[k]->src[s] == rs || cgraph->nodes[k]->view_src == rs) { ++n_readers; break; }
+            }
+        }
+        // the ADD is usually in place on the residual: bias[row] is read and dst[row] written by the same thread
+        auto disjoint = [&](const ggml_tensor * t) {
+            const uintptr_t a0 = (uintptr_t) t->data, a1 = a0 + ggml_nbytes(t), b0 = (uintptr_t) add->data, b1 = b0 + ggml_nbytes(add);
+            return !(a0 < b1 && b0 < a1);
+        };
+        if (bias && bias != rs && n_readers == 1 && ggml_is_contiguous(node) && ggml_is_contiguous(add) && ggml_is_contiguous(bias) &&
+                bias->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_are_same_shape(add->src[0], add->src[1]) &&
+                ggml_nelements(bias) == ggml_nelements(node) && node->ne[1] == 1 && ggml_cuda_should_fuse_mul_mat_vec_q(node) &&
+                disjoint(node->src[0]) && disjoint(node->src[1]) && (disjoint(bias) || bias->data == add->data)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias = bias;
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, add, &fusion_data);
+            return 2;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -7043,15 +7073,6 @@ static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     cuda_ctx->compute_epoch++;
-    if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
-        const uint64_t sig = ggml_cuda_graph_sig(cgraph);
-        if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
-            ggml_cuda_mmb_marks_clear(*cuda_ctx);
-            cuda_ctx->mmb_graph_sigs.clear();
-            cuda_ctx->mmb_res16_pending.clear();
-            cuda_ctx->mmb_first_split = nullptr;
-        }
-    }
     ggml_cuda_mmb_begin_graph(*cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -7183,9 +7204,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
         if (cuda_ctx->mmb_after_compute || cuda_ctx->mmb_first_split == nullptr || key == cuda_ctx->mmb_first_split) { ggml_cuda_mmb_marks_clear(*cuda_ctx); cuda_ctx->mmb_graph_sigs.clear(); cuda_ctx->mmb_res16_pending.clear(); cuda_ctx->mmb_first_split = key; cuda_ctx->mmb_after_compute = false; }
     }
-    // MoE prefill with a sigmoid-gated shared expert (qwen4exp, and any model with the same pattern): the weighted
+    // MoE with a sigmoid-gated shared expert (qwen35moe, qwen4exp, and any model with the same pattern): the weighted
     // reduction is followed by the shared-expert GEMMs and only then by SIGMOID(gate) -> MUL(shexp, .) -> ADD(moe_out, .).
-    // Move the reduction nodes down to just before the SIGMOID so the fusion computes reduction + merge in one kernel.
+    // Move the reduction nodes down to just before the SIGMOID so the fusion computes reduction + merge in one kernel
+    // (prefill and single-token decode; Qwen3.6 35B-A3B decode: 2.4 + 5.2 us -> 1.4 + 2.8 us per layer, +0.75%).
     // Only done when that fusion can fire (same predicate) and no node in between reads a reduction node or writes
     // (in place / through a view) memory the reduction reads. Runs before allocation, so buffer lifetimes follow the new
     // order. GGML_CUDA_DISABLE_MOE_SGMA=1 or GGML_CUDA_DISABLE_FUSION=1 keeps the original order.
@@ -7204,7 +7226,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) continue;
             ggml_cuda_moe_weighted_reduction_match mm;
-            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, mm) || ggml_nrows(mm.dst) < 512) continue;
+            // single-token decode and prefill; speculative verification batches (2..511 rows) keep the separate
+            // reduction (fused there the round takes ~1% longer, Qwen3.6 35B-A3B + DFlash)
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, mm) || (ggml_nrows(mm.dst) > 1 && ggml_nrows(mm.dst) < 512)) continue;
             const int cnt = mm.node_count;
             int k = -1;
             for (int n = i + cnt; n + 2 < cgraph->n_nodes && n <= i + cnt + 24; ++n) {
