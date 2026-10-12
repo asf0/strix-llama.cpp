@@ -5887,6 +5887,90 @@ struct test_gdn_conv_prefill : public test_case {
     }
 };
 
+// GATED_DELTA_NET -> RMS_NORM -> MUL(w) -> MUL(silu(z) or sigmoid(z)) -> out projection, as the qwen35 GDN layers build it for
+// prefill: the chunked scan applies the gated norm in its epilogue. proj = false ends the graph at the gated product.
+struct test_gdn_out_norm : public test_case {
+    const int64_t n_tokens, n_k_heads, n_v_heads;
+    const bool silu;
+    const bool proj;
+    test_gdn_out_norm(int64_t n_tokens, int64_t n_k_heads, int64_t n_v_heads, bool silu = true, bool proj = true)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), silu(silu), proj(proj) {}
+    std::string op_desc(ggml_tensor *) override { return "GDN_OUT_NORM"; }
+    std::string vars() override { return VARS_TO_STR5(n_tokens, n_k_heads, n_v_heads, silu, proj); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            if (strcmp(t->name, "gate") == 0)      init_tensor_uniform(t, -3.0f, -0.5f);
+            else if (strcmp(t->name, "beta") == 0) init_tensor_uniform(t, 0.0f, 0.5f);
+            else if (strcmp(t->name, "state") == 0) init_tensor_uniform(t, -0.01f, 0.01f);
+            else                                   init_tensor_uniform(t);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = 128, T = n_tokens;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_k_heads, T, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_k_heads, T, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, n_v_heads, T, 1);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, T, 1);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, T, 1);
+        ggml_tensor * s = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, n_v_heads, 1);
+        ggml_set_name(g, "gate");
+        ggml_set_name(b, "beta");
+        ggml_set_name(s, "state");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * gdn  = ggml_gated_delta_net(ctx, q, k, v, g, b, s, 1);
+        ggml_tensor * attn = ggml_view_4d(ctx, gdn, S, n_v_heads, T, 1, S*sizeof(float), S*n_v_heads*sizeof(float), S*n_v_heads*T*sizeof(float), 0);
+        ggml_tensor * z    = ggml_reshape_4d(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*n_v_heads, T), S, n_v_heads, T, 1);
+        ggml_tensor * w    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S);
+        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, attn, 1e-6f), w);
+        ggml_tensor * gated = ggml_mul(ctx, norm, silu ? ggml_silu(ctx, z) : ggml_sigmoid(ctx, z));
+        if (!proj) {
+            return gated;
+        }
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, S*n_v_heads, 256);
+        return ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, gated, S*n_v_heads, T));
+    }
+};
+
+// single-column MUL_MAT -> RESHAPE -> ADD(residual), the residual after the GDN output projection of qwen35 / qwen35moe decode:
+// the matvec adds the residual. The residual is a graph node, so the ADD can run in place on it.
+struct test_mmv_reshape_add : public test_case {
+    const ggml_type type;
+    const int64_t rows, inner;
+    const bool r_first;   // the residual is the first ADD operand
+    const bool bcast;     // a residual with 2 columns: the ADD operands differ in shape, not folded
+    const bool extra_use; // a second reader of the reshape: not folded
+    test_mmv_reshape_add(ggml_type type, int64_t rows, int64_t inner, bool r_first = false, bool bcast = false, bool extra_use = false)
+        : type(type), rows(rows), inner(inner), r_first(r_first || bcast), bcast(bcast), extra_use(extra_use) {}
+    std::string op_desc(ggml_tensor *) override { return "MMV_RESHAPE_ADD"; }
+    std::string vars() override { return VARS_TO_STR6(type, rows, inner, r_first, bcast, extra_use); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, type, inner, rows);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, inner, 1);
+        ggml_tensor * rs = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w, x), rows, 1, 1);
+        ggml_tensor * r  = ggml_scale(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, bcast ? 2 : 1, 1), 0.5f);
+        if (gf) {
+            ggml_build_forward_expand(gf, r); // the residual comes before the projection, as in the model
+        }
+        ggml_tensor * out = r_first ? ggml_add(ctx, r, rs) : ggml_add(ctx, rs, r);
+        return extra_use ? ggml_add(ctx, out, rs) : out;
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -6006,12 +6090,13 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 struct test_gdn_decode_rollback : public test_case {
     const int64_t n_tokens, K;
     const bool reverse;
+    const bool silu; // output norm gated with silu(z) instead of sigmoid(z)
     std::vector<ggml_tensor *> outputs;
 
-    test_gdn_decode_rollback(int64_t n_tokens, int64_t K, bool reverse = false)
-        : n_tokens(n_tokens), K(K), reverse(reverse) {}
+    test_gdn_decode_rollback(int64_t n_tokens, int64_t K, bool reverse = false, bool silu = false)
+        : n_tokens(n_tokens), K(K), reverse(reverse), silu(silu) {}
 
-    std::string vars() override { return VARS_TO_STR3(n_tokens, K, reverse); }
+    std::string vars() override { return VARS_TO_STR4(n_tokens, K, reverse, silu); }
     std::string op_desc(ggml_tensor *) override { return "GDN_DECODE_ROLLBACK"; }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
@@ -6061,7 +6146,8 @@ struct test_gdn_decode_rollback : public test_case {
         outputs.push_back(cpy);
         ggml_tensor * attn = ggml_view_4d(ctx, gdn, S, H_v, n_tokens, 1, S * sizeof(float), S * H_v * sizeof(float), S * H_v * n_tokens * sizeof(float), 0);
         ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, attn, 1e-6f), tensor(S, 1, "norm_w"));
-        ggml_tensor * out = ggml_mul(ctx, norm, ggml_sigmoid(ctx, ggml_reshape_4d(ctx, tensor(S * H_v, n_tokens, "z"), S, H_v, n_tokens, 1)));
+        ggml_tensor * z = ggml_reshape_4d(ctx, tensor(S * H_v, n_tokens, "z"), S, H_v, n_tokens, 1);
+        ggml_tensor * out = ggml_mul(ctx, norm, silu ? ggml_silu(ctx, z) : ggml_sigmoid(ctx, z));
         outputs.push_back(out);
         return out;
     }
@@ -14821,6 +14907,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second));
     }
     test_cases.emplace_back(new test_gdn_decode_rollback(4, 4, true));
+    for (const auto & shape : {std::pair<int64_t, int64_t>{1, 1}, {4, 4}}) {
+        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true));
+    }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
@@ -14881,6 +14970,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 1));     // Flash-Next channels
     test_cases.emplace_back(new test_ssm_conv_direct(256, 64, 1, 1, true));  // another whole-concat reader: no fusion
     // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
+    // chunked prefill (>= 256 tokens): gated output norm in the scan epilogue; shorter batches use the standalone gated norm kernel
+    // (both need >= 4096 norm rows)
+    for (int64_t T : {256, 300}) {
+        test_cases.emplace_back(new test_gdn_out_norm(T, 4, 16));
+        test_cases.emplace_back(new test_gdn_out_norm(T, 4, 16, false));
+        test_cases.emplace_back(new test_gdn_out_norm(T, 4, 16, true, false));
+    }
+    test_cases.emplace_back(new test_gdn_out_norm(100, 16, 64));
+    // GDN out-projection residual of decode: MUL_MAT -> RESHAPE -> ADD with one column
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mmv_reshape_add(type, 256, 512));
+        test_cases.emplace_back(new test_mmv_reshape_add(type, 256, 512, true));
+        test_cases.emplace_back(new test_mmv_reshape_add(type, 256, 512, false, true));
+        test_cases.emplace_back(new test_mmv_reshape_add(type, 256, 512, false, false, true));
+    }
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
     test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));
     // Multiple sequences must remain on the generic fallback.
