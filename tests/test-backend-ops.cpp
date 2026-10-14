@@ -5751,6 +5751,63 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// LFM2 gated shortconv block of the prefill graph: bx = TRANSPOSE(MUL(b, x)); CONCAT(state, bx) -> SSM_CONV -> MUL(c, .) -> out projection,
+// and the conv-state snapshot read from the concat. The multiplies fold into the transposing concat and the conv epilogue.
+struct test_lfm2_shortconv : public test_case {
+    const int64_t n_embd, n_tokens;
+    const bool conv_extra_use; // a second reader of the conv output: its multiply is not folded
+    const bool bx_extra_use;   // a second reader of MUL(b, x): its multiply is not folded into the concat
+    std::vector<ggml_tensor *> verify;
+    test_lfm2_shortconv(int64_t n_embd, int64_t n_tokens, bool conv_extra_use = false, bool bx_extra_use = false)
+        : n_embd(n_embd), n_tokens(n_tokens), conv_extra_use(conv_extra_use), bx_extra_use(bx_extra_use) {}
+    std::string op_desc(ggml_tensor *) override { return "LFM2_SHORTCONV"; }
+    std::string vars() override { return VARS_TO_STR4(n_embd, n_tokens, conv_extra_use, bx_extra_use); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    double max_nmse_err() override { return 5e-4; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t C = n_embd, T = n_tokens;
+        // the in-projection output [3C, T], an allocatable intermediate split into the b, c and x views
+        ggml_tensor * bcx = ggml_scale(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3*C, T, 1), 0.5f);
+        auto chunk = [&](int i) { return ggml_view_3d(ctx, bcx, C, T, 1, bcx->nb[1], bcx->nb[2], i * C * sizeof(float)); };
+        ggml_tensor * b = chunk(0), * c = chunk(1), * x = chunk(2);
+        ggml_tensor * bx_mul = ggml_mul(ctx, b, x);
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, 1);
+        ggml_tensor * cat = ggml_concat(ctx, state, ggml_transpose(ctx, bx_mul), 0);
+        ggml_tensor * snap = ggml_view_3d(ctx, cat, 3, C, 1, cat->nb[1], cat->nb[2], (cat->ne[0] - 3) * sizeof(float));
+        ggml_tensor * cpy  = ggml_cpy(ctx, snap, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, 1));
+        if (gf) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+        verify.push_back(cpy);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, cat, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C));
+        if (conv_extra_use) {
+            ggml_tensor * extra = ggml_scale(ctx, conv, 2.0f);
+            if (gf) {
+                ggml_build_forward_expand(gf, extra);
+            }
+            verify.push_back(extra);
+        }
+        if (bx_extra_use) {
+            ggml_tensor * extra = ggml_scale(ctx, bx_mul, 2.0f);
+            if (gf) {
+                ggml_build_forward_expand(gf, extra);
+            }
+            verify.push_back(extra);
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, C, C), ggml_mul(ctx, c, conv));
+        verify.push_back(out);
+        return out;
+    }
+};
+
 // CONCAT(state, transpose(x)) -> SSM_CONV -> SILU, plus the recurrent conv-state copies of the last 3 columns
 // (one per rollback slot, slot s ending s tokens earlier), as the GDN layers build it. Vulkan runs the conv
 // straight from x and the state and writes only the concat columns the copies read. Allocated through the
@@ -13266,6 +13323,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // LFM2 gated shortconv prefill: n_embd must be a multiple of 128, more than 32 tokens
+    test_cases.emplace_back(new test_lfm2_shortconv(256, 64));
+    test_cases.emplace_back(new test_lfm2_shortconv(512, 257));
+    test_cases.emplace_back(new test_lfm2_shortconv(256, 64, true));
+    test_cases.emplace_back(new test_lfm2_shortconv(256, 64, false, true));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
