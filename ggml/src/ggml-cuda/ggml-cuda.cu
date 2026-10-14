@@ -4972,6 +4972,29 @@ static bool ggml_cuda_moe_sgma_tail(const ggml_cuda_moe_weighted_reduction_match
         ggml_cuda_moe_weighted_reduction_sgma_supported(m.experts, m.expert_scale, m.weights, sig->src[0], mul->src[0], add);
 }
 
+// The residual ADD after the reduction usually has the residual allocated in place on the ADD output (the residual
+// stream dies there). One thread reads and writes the same element, so that overlap is safe; an overlap with any
+// other live source still refuses the fusion.
+static bool ggml_cuda_moe_resid_ranges_ok(const ggml_cgraph * cgraph, const int i, const int count,
+                                          const ggml_tensor * add, const ggml_tensor * resid) {
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const int64_t a0 = (int64_t) a->data, a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+        const int64_t b0 = (int64_t) b->data, b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+        return !(a1 <= b0 || b1 <= a0);
+    };
+    for (int j = i; j <= i + count; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (!src || src->op == GGML_OP_NONE || src == resid) continue;
+            bool elided = false;
+            for (int k = i; k < j && !elided; ++k) elided = cgraph->nodes[k] == src;
+            if (!elided && overlaps(add, src)) return false;
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5334,6 +5357,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                 }
             }
+            // residual ADD after the FFN right after the reduction, with the reduction used only there: one pass for
+            // both (bit-identical: the fused kernel adds the residual with the same single rounding as the ADD).
+            if (!merge && ggml_cuda_moe_sgma_enabled()) {
+                const int nadd = i + count;
+                if (nadd < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + count - 1, 1)) {
+                    ggml_tensor * add = cgraph->nodes[nadd];
+                    const ggml_tensor * r = add->op != GGML_OP_ADD ? nullptr :
+                        (add->src[0] == match.dst ? add->src[1] : (add->src[1] == match.dst ? add->src[0] : nullptr));
+                    if (r && r != add && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                            ggml_are_same_shape(add, match.dst) && ggml_are_same_shape(r, add) &&
+                            !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, add) && (add->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                        // the residual stream is usually allocated in place on the ADD output: one thread reads and writes
+                        // the same element, so that overlap is allowed, anything else uses the generic range check
+                        const bool inplace = r->data == add->data && ggml_nbytes(r) == ggml_nbytes(add);
+                        const bool ranges_ok = inplace ? ggml_cuda_moe_resid_ranges_ok(cgraph, i, count, add, r) :
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, count + 1, &nadd, 1);
+                        if (ranges_ok && ggml_cuda_op_moe_weighted_reduction_resid(*cuda_ctx, match.experts, match.expert_scale,
+                                match.weights, r, add)) {
+                            return count;
+                        }
+                    }
+                }
+            }
+
             const int output_idx = i + count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
@@ -7350,6 +7397,61 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (!indep) continue;
             std::rotate(cgraph->nodes + i, cgraph->nodes + i + cnt, cgraph->nodes + k);   // [between][reduction] SIGMOID MUL ADD
             i = k + 2;
+        }
+    }
+    // MoE without a shared expert (LFM2, ...): the residual ADD after the FFN, cur = ADD(cur, moe_out), can land far
+    // behind the reduction (LFM2 schedules the recurrent-state snapshots between them). Move the reduction down to
+    // just before the ADD so the fused reduction + residual kernel takes both, with the same independence rule as
+    // the sgma reorder above.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_moe_sgma_enabled()) {
+        auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        auto n_uses = [&](const ggml_tensor * t) {
+            int c = 0;
+            for (int n = 0; n < cgraph->n_nodes; ++n) {
+                for (int s = 0; s < GGML_MAX_SRC && cgraph->nodes[n]->src[s]; ++s) {
+                    c += cgraph->nodes[n]->src[s] == t;
+                }
+            }
+            return c;
+        };
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_MUL) continue;
+            ggml_cuda_moe_weighted_reduction_match mm;
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, mm) || (ggml_nrows(mm.dst) > 1 && ggml_nrows(mm.dst) < 512)) continue;
+            const int cnt = mm.node_count;
+            if (n_uses(mm.dst) != 1) continue;
+            // leave a shared-expert merge (SIGMOID -> MUL -> ADD) to the sgma path and its own reorder
+            bool sgma = false;
+            for (int n = i + cnt; n + 2 < cgraph->n_nodes && n <= i + cnt + 24 && !sgma; ++n) {
+                sgma = ggml_cuda_moe_sgma_tail(mm, cgraph->nodes[n], cgraph->nodes[n + 1], cgraph->nodes[n + 2]);
+            }
+            if (sgma) continue;
+            int k = -1;
+            for (int n = i + cnt; n < cgraph->n_nodes && n <= i + cnt + 24; ++n) {
+                const ggml_tensor * add = cgraph->nodes[n];
+                if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+                        !ggml_are_same_shape(add, mm.dst) || (add->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+                        ggml_cuda_mmb_is_bf16_only(*cuda_ctx, add)) continue;
+                const ggml_tensor * r = add->src[0] == mm.dst ? add->src[1] : (add->src[1] == mm.dst ? add->src[0] : nullptr);
+                if (r && r != add && r->type == GGML_TYPE_F32 && ggml_is_contiguous(r) && ggml_are_same_shape(r, add)) { k = n; break; }
+            }
+            if (k <= i + cnt) continue;   // not found, or already adjacent
+            bool indep = true;
+            for (int n = i + cnt; n < k && indep; ++n) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int r = i; r < i + cnt && indep; ++r) {
+                    const ggml_tensor * red = cgraph->nodes[r];
+                    for (int s = 0; s < GGML_MAX_SRC && t->src[s] && indep; ++s) {
+                        indep = t->src[s] != red && root(t->src[s]) != red;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC && red->src[s] && indep; ++s) {
+                        indep = !(t->view_src && root(red->src[s]) == t->view_src) && red->src[s] != t;
+                    }
+                }
+            }
+            if (!indep) continue;
+            std::rotate(cgraph->nodes + i, cgraph->nodes + i + cnt, cgraph->nodes + k);
+            i = k;
         }
     }
     // Single-token GDN step (the fused decode kernel matches CONCAT ... GATED_DELTA_NET with the gate / beta inputs already

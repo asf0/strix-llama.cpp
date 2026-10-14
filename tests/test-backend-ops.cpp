@@ -9124,16 +9124,28 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const int resid; // residual ADD after the reduction: 0 none, 1 an input, 2 a graph node (the ADD can run in place on it), 3 as 2 and a second reader of the sum
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false, int resid = 0) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), resid(resid) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        std::string s = VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return resid ? s + "," + VAR_TO_STR(resid) : s;
+    }
+
+    bool use_scheduler_allocation() override { return resid >= 2; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (resid < 2 || t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9144,6 +9156,16 @@ struct test_moe_reduce : public test_case {
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * r = nullptr;
+        if (resid) {
+            r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            if (resid >= 2) {
+                r = ggml_scale(ctx, r, 0.5f);
+                if (gf) {
+                    ggml_build_forward_expand(gf, r); // the residual comes before the FFN, as in the model
+                }
+            }
+        }
         ggml_tensor * experts;
         if (unaligned_experts) {
             ggml_tensor * storage = ggml_new_tensor_1d(
@@ -9186,6 +9208,10 @@ struct test_moe_reduce : public test_case {
             }
         }
         ggml_set_name(out, "moe_reduce");
+        if (resid) {
+            ggml_tensor * sum = ggml_add(ctx, r, out);
+            return resid == 3 ? ggml_add(ctx, sum, out) : sum;
+        }
         return out;
     }
 };
@@ -9298,21 +9324,23 @@ struct test_moe_shexp_merge : public test_case {
     const bool with_expert_scale;
     const bool between;
     const bool hazard;
+    const int resid; // residual ADD after the merge: 0 none, 1 an input, 2 a graph node (the ADD can run in place on it)
     const int n_mats = 16;
     const int64_t k = 256;
     ggml_tensor * writer_node = nullptr;
 
     test_moe_shexp_merge(ggml_type type_down, int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-                         bool with_expert_scale, bool between, bool hazard = false)
+                         bool with_expert_scale, bool between, bool hazard = false, int resid = 0)
         : type_down(type_down), n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
-          with_expert_scale(with_expert_scale), between(between), hazard(hazard) {}
+          with_expert_scale(with_expert_scale), between(between), hazard(hazard), resid(resid) {}
 
     std::string vars() override {
-        return VARS_TO_STR7(type_down, n_embd, n_expert_used, n_tokens, with_expert_scale, between, hazard);
+        std::string s = VARS_TO_STR7(type_down, n_embd, n_expert_used, n_tokens, with_expert_scale, between, hazard);
+        return resid ? s + "," + VAR_TO_STR(resid) : s;
     }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_SHEXP_MERGE"; }
     bool run_whole_graph() override { return true; }
-    bool use_scheduler_allocation() override { return between; }
+    bool use_scheduler_allocation() override { return between || resid >= 2; }
     double max_nmse_err() override { return type_down == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -9348,8 +9376,23 @@ struct test_moe_shexp_merge : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
-        ggml_set_name(x, "x");
+        // inputs only the "between" graph reads: unused tensors are not allocated through the scheduler
+        ggml_tensor * x = nullptr;
+        if (between) {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+            ggml_set_name(x, "x");
+        }
+
+        ggml_tensor * r = nullptr;
+        if (resid) {
+            r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            if (resid >= 2) {
+                r = ggml_scale(ctx, r, 0.5f);
+                if (gf) {
+                    ggml_build_forward_expand(gf, r); // the residual comes before the FFN, as in the model
+                }
+            }
+        }
 
         ggml_tensor * experts;
         if (type_down == GGML_TYPE_F32) {
@@ -9386,12 +9429,12 @@ struct test_moe_shexp_merge : public test_case {
         ggml_set_name(red, "moe_out");
 
         // shared expert and its gate logit
-        ggml_tensor * w_sh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_embd);
-        ggml_set_name(w_sh, "w_shexp");
-        ggml_tensor * w_g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
-        ggml_set_name(w_g, "w_shexp_gate");
         ggml_tensor * shexp, * logit;
         if (between) {
+            ggml_tensor * w_sh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_embd);
+            ggml_set_name(w_sh, "w_shexp");
+            ggml_tensor * w_g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+            ggml_set_name(w_g, "w_shexp_gate");
             shexp = ggml_mul_mat(ctx, w_sh, x);
             if (mode == MODE_TEST) { ggml_build_forward_expand(gf, shexp); }
             if (hazard) {
@@ -9410,6 +9453,9 @@ struct test_moe_shexp_merge : public test_case {
         ggml_set_name(shexp, "shexp");
         ggml_tensor * gated = ggml_mul(ctx, shexp, ggml_sigmoid(ctx, logit));
         ggml_tensor * out = ggml_add(ctx, red, gated);
+        if (resid) {
+            out = ggml_add(ctx, r, out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -14079,6 +14125,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // repeated expert ids within a row, speculative verification batches of 2-8 tokens (grouped mat-vec on RDNA3.5: the group
+    // of an expert holds at most one pair per token)
+    for (ggml_type ta : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (int n : {2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, true, 1024, 4, 256));
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -15080,6 +15135,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    // residual ADD after the FFN folded into the reduction: leaf and in-place residual, expert scale, unaligned experts, a second reader of the sum
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, false, false, 1));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, false, false, 2));
+    test_cases.emplace_back(new test_moe_reduce(2048, 10, 33, false, true, false, 2));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, false, false, 3));
+    test_cases.emplace_back(new test_moe_reduce(64, 6, 17, true, false, false, 1));
 
     // reduction + sigmoid-gated shared-expert merge: adjacent (fusion only) and with the shared-expert GEMMs in between
     // (graph_optimize reorder at >= 512 tokens); n_embd 2560 / 2048 / 4608 cover 640, 512 and the 256-thread fallback
@@ -15091,6 +15152,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_Q8_0,   2048, 8,  512, false, true));
     test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2560, 10, 512, true,  true, true));
     test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_IQ4_NL, 2560, 10, 512, true,  true, true));
+    // residual ADD after the FFN folded into the merge kernel
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2048, 8,  512, false, false, false, 1));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2048, 8,  512, false, false, false, 2));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2560, 10, 512, true,  true,  false, 2));
 
     for (const auto & shape : {std::pair<int64_t, int64_t>{1, 1}, {1, 4}, {2, 4}, {3, 3}, {4, 4}, {5, 5}, {8, 8}}) {
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second));
