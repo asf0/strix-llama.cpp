@@ -4083,6 +4083,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return bias == 0.0f && scale->type == GGML_TYPE_F32;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * gate     = (mul->src[0] == ssm_conv) ? mul->src[1] : (mul->src[1] == ssm_conv ? mul->src[0] : nullptr);
+        if (!gate || ssm_conv->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // the gate must be a per-channel tensor of the output's shape, indexed channel-first (its rows may be views
+        // into a wider tensor, as in the LFM2 in-projection split)
+        if (gate->nb[0] != ggml_type_size(GGML_TYPE_F32) || gate->ne[0] != mul->ne[0] || gate->ne[1] != mul->ne[1] ||
+                gate->ne[2] != mul->ne[2] || gate->ne[3] != mul->ne[3]) {
+            return false;
+        }
+        return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 });
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -6580,6 +6596,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // LFM2 gated shortconv: MUL(b, x) is read only by CONCAT(state, TRANSPOSE(.)) -> SSM_CONV. The concat already
+    // transposes, so write the product there and drop the multiply pass (30 layers on LFM2.5).
+    if (node->op == GGML_OP_MUL && node->type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        int k = i + 1;
+        if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_TRANSPOSE && cgraph->nodes[k]->src[0] == node) {
+            k++;
+        }
+        if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_CONCAT && cgraph->nodes[k]->src[1]->view_src == node) {
+            ggml_tensor * cat = cgraph->nodes[k];
+            bool views_ok = ggml_node_get_use_count(cgraph, i) == 1;
+            for (int n = i + 1; n < k && views_ok; ++n) views_ok = ggml_node_get_use_count(cgraph, n) == 1;
+            const int out_idx = k;
+            if (views_ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, k - i + 1, &out_idx, 1) &&
+                    ggml_cuda_op_concat_mul(*cuda_ctx, cat, node)) {
+                return k - i;
+            }
+        }
+    }
+
+    // LFM2 gated shortconv: conv_out is read only by MUL(c, conv_out), whose result is read only by the out_proj
+    // GEMM. Fold the multiply into the conv epilogue, and write the BF16 copy the GEMM reads there as well, so the
+    // F32 write + the conversion pass for the product disappear. Prefill only: the short kernel has no epilogue.
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_MUL }, {}) && node->ne[1] > 32 &&
+            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_tensor * mul   = cgraph->nodes[i + 1];
+        uint16_t *    dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 1, mul);
+        ggml_cuda_op_ssm_conv(*cuda_ctx, node, nullptr, nullptr, mul, dst16);
+        return 1;
+    }
+
     // qwen4exp complete-block selection: sort the chosen blocks, gather their cells, validity, tail, in one kernel
     if (node->op == GGML_OP_CONT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_qsa_expand_args args;
@@ -7614,6 +7660,25 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ok = false;
             }
             if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, glu)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, glu);
+        }
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {   // LFM2 gated shortconv: MUL(c, conv_out) read only by its GEMM
+            const ggml_tensor * ssm_conv = cgraph->nodes[i];
+            const ggml_tensor * mul      = cgraph->nodes[i + 1];
+            if (ssm_conv->op != GGML_OP_SSM_CONV || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(mul) || mul->ne[1] <= 32 || ggml_node_get_use_count(cgraph, i) != 1) continue;
+            const ggml_tensor * gate = (mul->src[0] == ssm_conv) ? mul->src[1] : (mul->src[1] == ssm_conv ? mul->src[0] : nullptr);
+            if (!gate || gate->type != GGML_TYPE_F32 || gate->ne[0] != mul->ne[0] || gate->ne[1] != mul->ne[1] ||
+                    gate->ne[2] != mul->ne[2] || gate->ne[3] != mul->ne[3]) continue;
+            bool ok = true; int nread = 0;
+            for (int n = i + 2; n < cgraph->n_nodes && ok; ++n) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                if (!reads(t, mul)) continue;
+                ++nread;
+                if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
+                    ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
+                ok = false;
+            }
+            if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, mul)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, mul);
         }
     }
 
