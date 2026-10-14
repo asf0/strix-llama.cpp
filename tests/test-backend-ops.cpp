@@ -6799,6 +6799,60 @@ struct test_mmb_quant_routed : test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID -> RELU -> SQR (Nemotron-H expert up projection): folded into the epilogue of the routed MMB GEMM
+struct test_mmb_relu_sqr : test_mul_mat_id {
+    const bool extra_use; // a second reader of the relu output: not folded
+    test_mmb_relu_sqr(ggml_type type, int tokens, bool extra_use = false, int rows = 128, int n_mats = 8, int n_used = 2, int inner = 256)
+        : test_mul_mat_id(type, GGML_TYPE_F32, n_mats, n_used, false, rows, tokens, inner), extra_use(extra_use) {}
+    std::string op_desc(ggml_tensor *) override { return "MMB_RELU_SQR"; }
+    std::string vars() override { return test_mul_mat_id::vars() + "," + VAR_TO_STR(extra_use); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * relu = ggml_relu(ctx, test_mul_mat_id::build_graph(ctx));
+        ggml_tensor * sqr  = ggml_sqr(ctx, relu);
+        return extra_use ? ggml_add(ctx, sqr, relu) : sqr;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && t->type != GGML_TYPE_I32) init_tensor_uniform(t);
+        }
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// dense MUL_MAT [-> RESHAPE] -> ADD(residual) (attention / GDN output projection): the MMB GEMM adds the residual in its epilogue
+struct test_mmb_add : test_case {
+    const ggml_type type;
+    const int64_t tokens, rows, inner;
+    const bool reshape;   // the ADD reads a 3D reshape of the product
+    const bool r_first;   // the residual is the first ADD operand
+    const bool extra_use; // a second reader of the product: not folded
+    test_mmb_add(ggml_type type, int64_t tokens, bool reshape, bool r_first = false, bool extra_use = false, int64_t rows = 128, int64_t inner = 256)
+        : type(type), tokens(tokens), rows(rows), inner(inner), reshape(reshape), r_first(r_first), extra_use(extra_use) {
+        GGML_ASSERT(!reshape || tokens % 2 == 0);
+    }
+    std::string op_desc(ggml_tensor *) override { return "MMB_ADD"; }
+    std::string vars() override { return VARS_TO_STR7(type, tokens, rows, inner, reshape, r_first, extra_use); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, inner, rows);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, inner, tokens);
+        ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        ggml_tensor * cur = reshape ? ggml_reshape_3d(ctx, y, rows, tokens / 2, 2) : y;
+        ggml_tensor * r = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, cur->ne);
+        ggml_tensor * out = r_first ? ggml_add(ctx, r, cur) : ggml_add(ctx, cur, r);
+        return extra_use ? ggml_add(ctx, out, cur) : out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+};
+
 struct test_swiglu_q8_mmq : public test_case {
     const bool use_id;
     const int n_mats;
@@ -12080,6 +12134,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true, 65));
             test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
         }
+    }
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        // relu(x)^2 of the routed up GEMM (Nemotron-H experts), and with a second reader of the relu output
+        test_cases.emplace_back(new test_mmb_relu_sqr(type, 512));
+        test_cases.emplace_back(new test_mmb_relu_sqr(type, 513, false, 129, 16, 4));
+        test_cases.emplace_back(new test_mmb_relu_sqr(type, 512, true));
+    }
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        // residual ADD in the epilogue of the dense GEMM, with and without the reshape, and with a second reader of the product
+        test_cases.emplace_back(new test_mmb_add(type, 512, false));
+        test_cases.emplace_back(new test_mmb_add(type, 513, false, true, false, 129));
+        test_cases.emplace_back(new test_mmb_add(type, 512, true));
+        test_cases.emplace_back(new test_mmb_add(type, 770, true, true));
+        test_cases.emplace_back(new test_mmb_add(type, 512, false, false, true));
+        test_cases.emplace_back(new test_mmb_add(type, 512, true, false, true));
     }
     // qwen4exp shapes around the 32-row MMB gate, for the weight types MMB takes: MMQ below it, MMB from it
     for (int tokens : {16, 31, 32, 33, 127, 128, 473, 511, 512, 513}) {

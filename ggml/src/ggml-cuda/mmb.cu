@@ -151,7 +151,7 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
 __device__ __forceinline__ void mmb_lds_barrier() {
     ggml_cuda_lds_barrier();
 }
-template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn, int ACT = 0>
 __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase, const size_t wrow_bytes, const int a_rows,
         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
         const int n_cols, uint16_t * As, uint16_t * Bs, const float * R = nullptr) {
@@ -267,8 +267,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         const int ml = wm * WTM + i * 16; const bool ok = ml < a_rows;
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
-            if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, R);
-            else { __syncthreads(); __syncthreads(); }
+            if (ok && jact[j]) {
+                v8f v = acc[i][j];
+                if constexpr (ACT == 1) { for (int e = 0; e < 8; ++e) { const float r = fmaxf(v[e], 0.0f); v[e] = r * r; } }
+                mmb_store_tile(v, stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, R);
+            } else { __syncthreads(); __syncthreads(); }
         }
     }
 }
@@ -402,7 +405,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
 #endif
 }
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE = 0>
+template <int BM, int BN, int WTM, int WTN, int WTYPE = 0, bool ACTR = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
         uint16_t * __restrict__ Dh, const bool store_f32,
@@ -419,8 +422,10 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
     const int m0 = blockIdx.x * BM;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
-    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
-        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+    auto xr = [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; };
+    auto dr = [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; };
+    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, decltype(xr), decltype(dr), ACTR ? 1 : 0>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+        xr, D, Dh, store_f32, M, dr, m0, cnt, As, Bs);
 #endif
 }
 
@@ -1382,7 +1387,7 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     return true;
 }
 
-void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const int act) {
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1], E = (int) src0->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
@@ -1422,7 +1427,10 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-    if (RT == 1) {
+    if (act) {   // fused relu(x)^2 epilogue: the activation kernel and its f32 round trip disappear
+        mmb_routed_kernel<128, BN, 32, 64, WT, true><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        mmb_routed_kernel<128, BN_SMALL, 16, 32, WT, true><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else if (RT == 1) {
         const dim3 gb((M + 63) / 64, nbig_max), gs((M + 63) / 64, nsmall_max);
         mmb_routed_kernel<64, BN, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
         mmb_routed_kernel<64, BN_SMALL, 16, 16, WT><<<gs, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
