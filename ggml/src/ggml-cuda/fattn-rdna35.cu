@@ -6,6 +6,8 @@
 // another type (q8_0, q4_0, ...) is converted to f16 first, into the scratch space behind dst: at 32k keys and 4096
 // tokens that is ~1% of the attention time, while the generic kernels such a cache fell back to are ~2x slower.
 // Small batches at depth read q8_0 K/V directly (dequantized while staged to LDS): they are bound by the K/V reads.
+// Absorbed MLA (deepseek2 family, DKQ = kv_lora_rank + rope, DV = kv_lora_rank) is served the same way: K spans
+// DKQ dims while V reads its first DV dims of the same (strided or converted) cache rows; the O tile follows DV.
 //
 // The generic MMA kernel keeps fp32 accumulators for 16 query columns x all V dims per warp (128 VGPRs at
 // D = 256), so Q cannot stay in registers, every WMMA re-reads both operands from LDS and the kernel
@@ -43,31 +45,38 @@ constexpr float log2e    = 1.44269504088896340736f;
 constexpr float T_LAZY   = 8.0f;   // OWN: the reference max moves when a step max is more than this above it (log2 units)
 constexpr float T_HI     = 14.0f;  // OWN: above this P would leave the f16 range -> redo the step against the new max
 
-template <int D>
+// DKQ = Q/K head dim, DV = V head dim. The generic GQA models have DV == DKQ; MLA (absorbed deepseek2-family
+// attention) has DKQ == kv_lora_rank + rope (576) and DV == kv_lora_rank (512), with V a strided view of the
+// K cache rows (both read from one buffer, V only its first DV dims). The K-side constants (SEGS/SQK/QCH and
+// the sK tile) follow DKQ, the V^T staging and the O epilogue follow DV.
+template <int DKQ, int DV = DKQ>
 struct cfg {
-    static constexpr int NCOLS  = 64;                   // query columns per block (32 at D = 512: 16.3 vs 25.6 TFLOPS, K/V reuse halves)
+    static constexpr int NCOLS  = DV >= 512 ? 32 : 64;  // query columns per block (32 at DV = 512: 16.3 vs 25.6 TFLOPS, K/V reuse halves)
     static constexpr int NCT    = NCOLS / 16;           // column tiles
-    static constexpr int DQ     = D > 128 ? D / 128 : 1; // warps per column tile, splitting D in the score phase
-    static constexpr int QCH    = D / DQ / 16;          // 16-dim chunks of Q per warp
+    static constexpr int DQ     = DKQ > 128 ? DKQ / 128 : 1; // warps per column tile, splitting D in the score phase
+    static constexpr int QCH    = DKQ / DQ / 16;        // 16-dim chunks of Q per warp
     static constexpr int NWARPS = NCT * DQ;
     static constexpr int NTHR   = NWARPS * 32;
-    static constexpr int OT     = D / NWARPS / 16;      // warp w owns V dims [16*OT*w, 16*OT*(w+1))
-    static constexpr int NKEYS  = D == 512 ? 16 : D == 64 ? 64 : 32; // keys per step: 32 WMMAs per warp and step
+    static constexpr int OT     = DV / NWARPS / 16;     // warp w owns V dims [16*OT*w, 16*OT*(w+1))
+    static constexpr int NKEYS  = DV >= 512 ? 16 : DKQ == 64 ? 64 : 32; // keys per step: 32 WMMAs per warp and step
     static constexpr int KT     = NKEYS / 16;           // key tiles per step
-    static constexpr int SEGS   = D / 8;                // 16 B segments per K/V row
-    static constexpr int KPT    = NKEYS * SEGS / NTHR;  // K and V rows (keys) per thread and step
+    static constexpr int SEGS   = DKQ / 8;              // 16 B segments per K row
+    static constexpr int SEGSV  = DV / 8;               // 16 B segments per V row
+    static constexpr int WPRV   = SEGSV / 8;            // warps per V row
+    static constexpr int NKP    = (NKEYS*SEGS + NTHR - 1) / NTHR; // K rows (keys) per thread and step (last pass may be partial)
+    static constexpr int KPT    = (NKEYS*SEGSV) / NTHR; // V keys per thread and step
     // D = 512 runs at 192 VGPRs (2 blocks per WGP). With V prefetched as well and all P operands of a key tile loaded at
     // once, the loop spilled and its scratch reloads waited for the K/V loads (vmcnt is in order): 26.7 TFLOPS. Loading V
     // after the first barrier, one score chain and P one operand at a time: 29.5. At D = 256 both cost ~1%.
-    static constexpr bool TIGHT = D == 512;
+    static constexpr bool TIGHT = DV >= 512;
     // D = 256: warp dq of a column tile finishes key tile dq of the step (half the score exchange and softmax per warp).
     static constexpr bool OWN   = KT == DQ;
-    static constexpr int SQK    = D + 8;                // row stride (halves) of sK:     conflict-free 16-row reads
+    static constexpr int SQK    = DKQ + 8;              // row stride (halves) of sK:     conflict-free 16-row reads
     static constexpr int SVT    = NKEYS + 8;            // row stride (halves) of sVt/sP: conflict-free 16-row reads
     static constexpr int NUNITS = NKEYS / 8;            // 8-key units of a V^T row (swizzled)
 
     static constexpr int SZ_K   = NKEYS * SQK * 2;
-    static constexpr int SZ_VT  = D * SVT * 2;
+    static constexpr int SZ_VT  = DV * SVT * 2;
     static constexpr int SZ_P   = NCOLS * SVT * 2;
     // partial scores [warp][key tile][lane][8]; one warp per column tile (D <= 128) needs no exchange, only the column maxima
     static constexpr int SZ_SX  = DQ == 1 ? NCOLS * 4 : NWARPS * (OWN ? 1 : KT) * 32 * 8 * 4;
@@ -82,9 +91,11 @@ struct cfg {
     static constexpr int OFF_CLS = OFF_RED + SZ_RED;
     static constexpr int SZ_SMEM = OFF_CLS + SZ_CLS;
 
+    static_assert(DV <= DKQ, "V head dim cannot exceed the K/Q head dim");
     static_assert(KPT == 2 || KPT == 4, "V transpose handles 2 or 4 keys per thread");
-    static_assert(SEGS % 8 == 0 && NTHR % SEGS == 0, "thread layout");
-    static_assert(QCH == 8 || (DQ == 1 && QCH == 4), "Q chunks per warp");
+    static_assert(SEGS % 8 == 0 && SEGSV % 8 == 0 && NTHR % SEGSV == 0, "thread layout");
+    static_assert(NWARPS % WPRV == 0 && NKEYS == KPT*4*(NWARPS / WPRV), "V staging key coverage");
+    static_assert(QCH == 8 || (DQ == 1 && QCH == 4) || (DQ == 4 && QCH == 9), "Q chunks per warp");
     static_assert(NKEYS % CLS_KEYS == 0 || CLS_KEYS % NKEYS == 0, "mask classes per step");
     static_assert(SZ_SMEM + 16 <= 65536, "LDS budget");
 };
@@ -148,27 +159,32 @@ static __device__ __forceinline__ u32x4_t dequant_seg_q8(const u32x4_t r, const 
     return out;
 }
 
-// K tile: KPT x 16 B per thread; the lanes of a wave read 512 contiguous bytes of a key row.
-template <int D, bool Q8>
+// K tile: NKP x 16 B per thread; the lanes of a wave read 512 contiguous bytes of a key row. The last pass is
+// partial when the K row segments per step (DKQ wide) do not divide evenly by the threads (MLA DKQ = 576).
+template <class C, bool Q8>
 static __device__ __forceinline__ void load_K(u32x4_t * regs, const char * K, const uint32_t nb11, const int k0) {
-    using C = cfg<D>;
+    constexpr int NITEMS = C::NKEYS*C::SEGS;
 #pragma unroll
-    for (int p = 0; p < C::KPT; ++p) {
+    for (int p = 0; p < C::NKP; ++p) {
         const int idx = p*C::NTHR + threadIdx.x;
-        if constexpr (Q8) {
-            regs[p] = load_seg_q8(K + uint32_t(k0 + idx/C::SEGS)*nb11, idx % C::SEGS);
-        } else {
-            regs[p] = *(const u32x4_t *) (K + (uint32_t(k0 + idx/C::SEGS)*nb11 + uint32_t(idx % C::SEGS)*16u));
+        if (NITEMS % C::NTHR == 0 || idx < NITEMS) {
+            if constexpr (Q8) {
+                regs[p] = load_seg_q8(K + uint32_t(k0 + idx/C::SEGS)*nb11, idx % C::SEGS);
+            } else {
+                regs[p] = *(const u32x4_t *) (K + (uint32_t(k0 + idx/C::SEGS)*nb11 + uint32_t(idx % C::SEGS)*16u));
+            }
         }
     }
 }
-template <int D, bool Q8>
+template <class C, bool Q8>
 static __device__ __forceinline__ void store_K(const u32x4_t * regs, _Float16 * sK) {
-    using C = cfg<D>;
+    constexpr int NITEMS = C::NKEYS*C::SEGS;
 #pragma unroll
-    for (int p = 0; p < C::KPT; ++p) {
+    for (int p = 0; p < C::NKP; ++p) {
         const int idx = p*C::NTHR + threadIdx.x;
-        *(u32x4_t *) (sK + (idx/C::SEGS)*C::SQK + (idx % C::SEGS)*8) = Q8 ? dequant_seg_q8(regs[p], idx % C::SEGS) : regs[p];
+        if (NITEMS % C::NTHR == 0 || idx < NITEMS) {
+            *(u32x4_t *) (sK + (idx/C::SEGS)*C::SQK + (idx % C::SEGS)*8) = Q8 ? dequant_seg_q8(regs[p], idx % C::SEGS) : regs[p];
+        }
     }
 }
 
@@ -247,8 +263,8 @@ static __device__ __forceinline__ half16_t load_Vt_operand(const _Float16 * sVt,
 
 // D = 512: a 16-wave block at up to 256 VGPRs fits once per WGP, so the SIMDs idle while its warps wait at the barriers.
 // Capped at 192 VGPRs (8 waves per SIMD) a second block fits (LDS allows two) and fills these gaps (see cfg::TIGHT).
-template <int D, int NCOLS2, bool Q8>
-__launch_bounds__(cfg<D>::NTHR, cfg<D>::NWARPS == 16 ? 8 : 1) // HIP: the second argument is the minimum number of waves per SIMD
+template <int DKQ, int DV, int NCOLS2, bool Q8>
+__launch_bounds__((cfg<DKQ, DV>::NTHR), (cfg<DKQ, DV>::NWARPS == 16 ? 8 : 1)) // HIP: the second argument is the minimum number of waves per SIMD
 static __global__ void flash_attn_rdna35(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, const uint8_t * __restrict__ mask_cls, const int * __restrict__ KV_max, float * __restrict__ dst,
@@ -259,7 +275,7 @@ static __global__ void flash_attn_rdna35(
         const int64_t nb21, const int64_t nb22, const int64_t nb23,
         const int ne31, const int ne33, const int64_t nb31, const int64_t nb33) {
 #ifdef FATTN_RDNA35_AVAILABLE
-    using C = cfg<D>;
+    using C = cfg<DKQ, DV>;
     constexpr int NCOLS  = C::NCOLS;
     constexpr int NCOLS1 = NCOLS / NCOLS2;
     constexpr int NUSED  = NCOLS1 * NCOLS2; // NCOLS2 = 6: 60 of the 64 columns
@@ -351,7 +367,7 @@ static __global__ void flash_attn_rdna35(
     {
         const int  token = jt*NCOLS1 + c_s/NCOLS2;
         const bool valid = token < ne01 && c_s < NUSED;
-        const float * qrow = (const float *) (Q + seq*nb03 + int64_t(head0 + c_s % NCOLS2)*nb02 + int64_t(valid ? token : 0)*nb01) + (D/DQ)*dq;
+        const float * qrow = (const float *) (Q + seq*nb03 + int64_t(head0 + c_s % NCOLS2)*nb02 + int64_t(valid ? token : 0)*nb01) + (DKQ/DQ)*dq;
 #pragma unroll
         for (int k = 0; k < C::QCH; ++k) {
 #pragma unroll
@@ -366,12 +382,12 @@ static __global__ void flash_attn_rdna35(
     }
     __syncthreads(); // classes and sRescaleStep visible
 
-    u32x4_t kregs[C::KPT];
+    u32x4_t kregs[C::NKP];
     u32x4_t vregs[C::KPT];
     int cur = next_active(st_begin);
     if (cur < st_end) {
-        load_K<D, Q8>(kregs, K_h, nb11u, cur*NKEYS);
-        store_K<D, Q8>(kregs, sK);
+        load_K<C, Q8>(kregs, K_h, nb11u, cur*NKEYS);
+        store_K<C, Q8>(kregs, sK);
     }
     __syncthreads();
 
@@ -439,10 +455,10 @@ static __global__ void flash_attn_rdna35(
 
         // V of this step (not at D = 512) and K of the next one: in flight while the scores are computed.
         if constexpr (!C::TIGHT) {
-            load_V<D, Q8>(vregs, V_h, nb21u, k0);
+            load_V<DV, Q8>(vregs, V_h, nb21u, k0);
         }
         if (has_next) {
-            load_K<D, Q8>(kregs, K_h, nb11u, nxt*NKEYS);
+            load_K<C, Q8>(kregs, K_h, nb11u, nxt*NKEYS);
         }
 
         // ---- partial S^T = K Q^T over dims [128dq, 128dq+128), all key tiles of the step ----
@@ -456,7 +472,7 @@ static __global__ void flash_attn_rdna35(
             const _Float16 * ka[KT];
 #pragma unroll
             for (int kt = 0; kt < KT; ++kt) {
-                ka[kt] = sK + (16*(C::OWN ? kt ^ dq : kt) + l16)*C::SQK + (D/DQ)*dq;
+                ka[kt] = sK + (16*(C::OWN ? kt ^ dq : kt) + l16)*C::SQK + (DKQ/DQ)*dq;
             }
             half16_t a[KT];
 #pragma unroll
@@ -486,7 +502,7 @@ static __global__ void flash_attn_rdna35(
             for (int k = 0; k < C::QCH; ++k) {
 #pragma unroll
                 for (int kt = 0; kt < KT; ++kt) {
-                    S[kt] = wmma(*(const half16_t *) (sK + (16*(C::OWN ? kt ^ dq : kt) + l16)*C::SQK + (D/DQ)*dq + 16*k), qb[k], S[kt]);
+                    S[kt] = wmma(*(const half16_t *) (sK + (16*(C::OWN ? kt ^ dq : kt) + l16)*C::SQK + (DKQ/DQ)*dq + 16*k), qb[k], S[kt]);
                 }
             }
         }
@@ -636,11 +652,11 @@ static __global__ void flash_attn_rdna35(
 
         // ---- stage V^T of this step and K of the next one (both buffers are free after B1) ----
         if constexpr (C::TIGHT) {
-            load_V<D, Q8>(vregs, V_h, nb21u, k0);
+            load_V<DV, Q8>(vregs, V_h, nb21u, k0);
         }
-        store_Vt<D, Q8>(vregs, sVt);
+        store_Vt<DV, Q8>(vregs, sVt);
         if (has_next) {
-            store_K<D, Q8>(kregs, sK);
+            store_K<C, Q8>(kregs, sK);
         }
         lds_barrier(); // B2: P, V^T, rescale factors and the next K visible
 
@@ -707,7 +723,7 @@ static __global__ void flash_attn_rdna35(
             }
 #pragma unroll
             for (int i = 0; i < OT; ++i) {
-                const half16_t a = load_Vt_operand<D>(sVt, 16*OT*w + 16*i + l16, c);
+                const half16_t a = load_Vt_operand<DV>(sVt, 16*OT*w + 16*i + l16, c);
 #pragma unroll
                 for (int t = 0; t < NCT; ++t) {
                     O[i][t] = wmma(a, b[t], O[i][t]);
@@ -719,7 +735,7 @@ static __global__ void flash_attn_rdna35(
             half16_t a[OT];
 #pragma unroll
             for (int i = 0; i < OT; ++i) {
-                a[i] = load_Vt_operand<D>(sVt, 16*OT*w + 16*i + l16, c);
+                a[i] = load_Vt_operand<DV>(sVt, 16*OT*w + 16*i + l16, c);
             }
 #pragma unroll
             for (int t = 0; t < NCT; ++t) {
@@ -778,7 +794,7 @@ static __global__ void flash_attn_rdna35(
         }
         const int64_t j_dst = (int64_t(seq)*ne01 + token)*ne02 + head;
         if (nsplit > 1) {
-            float * part = dst_parts + (j_dst*nsplit + blockIdx.y)*D;
+            float * part = dst_parts + (j_dst*nsplit + blockIdx.y)*DV;
 #pragma unroll
             for (int i = 0; i < OT; ++i) {
 #pragma unroll
@@ -792,7 +808,7 @@ static __global__ void flash_attn_rdna35(
             continue;
         }
         const float inv = l_sum > 0.0f ? o_scl/l_sum : 0.0f;
-        float * dst_c = dst + j_dst*D;
+        float * dst_c = dst + j_dst*DV;
 #pragma unroll
         for (int i = 0; i < OT; ++i) {
 #pragma unroll
@@ -929,8 +945,16 @@ bool ggml_cuda_flash_attn_ext_rdna35_supported(const int device, const ggml_tens
     float max_bias;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    const int64_t D = Q->ne[0];
-    if ((D != 64 && D != 128 && D != 256 && D != 512) || K->ne[0] != D || V->ne[0] != D) return false;
+    const int64_t DKQ = Q->ne[0];
+    const int64_t DV  = V->ne[0];
+    // absorbed MLA (deepseek2 family): all cache state is in the K cache (kv_lora_rank + rope wide), V is a
+    // strided view of those rows reading only its first kv_lora_rank dims; n_head_kv == 1 (MQA). Both K and V
+    // reach this op through the same permute of the cache views, so they alias at the buffer base and share the
+    // key stride (V->nb[1] == K->nb[1]) while V's rows are only kv_lora_rank wide
+    const bool mla = DKQ == 576 && K->ne[0] == 576 && DV == 512 &&
+        V->data == K->data && V->nb[1] == K->nb[1] && V->nb[3] == K->nb[3] &&
+        V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] && V->type == K->type;
+    if (!mla && ((DKQ != 64 && DKQ != 128 && DKQ != 256 && DKQ != 512) || K->ne[0] != DKQ || DV != DKQ)) return false;
     if (Q->type != GGML_TYPE_F32 || !fattn_rdna35_kv_type_ok(K) || !fattn_rdna35_kv_type_ok(V)) return false;
     if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) return false;
     if (dst->src[5] || max_bias != 0.0f) return false;
@@ -958,10 +982,10 @@ bool ggml_cuda_flash_attn_ext_rdna35_supported(const int device, const ggml_tens
     return K->ne[1] >= 4096 && ((f16 && Q->ne[1] >= 2) || fattn_rdna35_q8_direct(dst));
 }
 
-template <int D, int NCOLS2>
+template <int DKQ, int DV, int NCOLS2>
 static void launch_fattn_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using namespace fattn_rdna35;
-    constexpr int NCOLS1 = cfg<D>::NCOLS / NCOLS2;
+    constexpr int NCOLS1 = cfg<DKQ, DV>::NCOLS / NCOLS2;
 
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -1047,16 +1071,21 @@ static void launch_fattn_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // small batches: split the key steps over more blocks (>= 16 steps each) to fill the GPU
     const int nblk      = ntiles*(Q->ne[2] / NCOLS2)*Q->ne[3];
     const int nsm       = ggml_cuda_info().devices[ctx.device].nsm;
-    const int max_split = std::max(1, int(K->ne[1] / (16*cfg<D>::NKEYS)));
+    const int max_split = std::max(1, int(K->ne[1] / (16*cfg<DKQ, DV>::NKEYS)));
     const int nsplit    = std::min(max_split, std::max(1, (2*nsm + nblk - 1) / nblk));
 
     const bool q8_direct = fattn_rdna35_q8_direct(dst);
 
-    // a K/V cache of another type: f16 copies in the scratch space behind dst
+    // a K/V cache of another type: f16 copies in the scratch space behind dst. For absorbed MLA, V reads the
+    // first kv_lora_rank dims of the same (possibly wider) rows as K: the tensors reach this op through permutes
+    // of the same cache view, so the aliasing is decided from the assigned pointers, not from view_src
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
     int64_t nbK[4] = {0, (int64_t) K->nb[1], (int64_t) K->nb[2], (int64_t) K->nb[3]};
     int64_t nbV[4] = {0, (int64_t) V->nb[1], (int64_t) V->nb[2], (int64_t) V->nb[3]};
+    const bool v_of_k = V->data == K->data && V->type == K->type &&
+        V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] && V->ne[3] == K->ne[3] &&
+        V->nb[1] == K->nb[1] && V->nb[2] == K->nb[2] && V->nb[3] == K->nb[3];
     if (!q8_direct && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) {
         const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
         if (K->type != GGML_TYPE_F16) {
@@ -1064,25 +1093,26 @@ static void launch_fattn_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * d
             K_data = (const char *) f16_extra.K;
         }
         if (V->type != GGML_TYPE_F16) {
-            if (f16_extra.V != f16_extra.K) {
-                fattn_rdna35_to_f16(V, (half *) f16_extra.V, nbV, stream);
+            if (v_of_k) {
+                memcpy(nbV, nbK, sizeof(nbK)); // V reads the converted K rows
+                V_data = K_data;
             } else {
-                memcpy(nbV, nbK, sizeof(nbK)); // V is a view of K
+                fattn_rdna35_to_f16(V, (half *) f16_extra.V, nbV, stream);
+                V_data = (const char *) f16_extra.V;
             }
-            V_data = (const char *) f16_extra.V;
         }
     }
 
     ggml_cuda_pool_alloc<float>  parts(ctx.pool());
     ggml_cuda_pool_alloc<float2> meta(ctx.pool());
     if (nsplit > 1) {
-        parts.alloc(size_t(nsplit)*Q->ne[1]*Q->ne[2]*Q->ne[3]*D);
+        parts.alloc(size_t(nsplit)*Q->ne[1]*Q->ne[2]*Q->ne[3]*DV);
         meta.alloc(size_t(nsplit)*Q->ne[1]*Q->ne[2]*Q->ne[3]);
     }
 
     const dim3 grid(ntiles*(Q->ne[2] / NCOLS2), nsplit, Q->ne[3]);
-    auto * kernel = q8_direct ? flash_attn_rdna35<D, NCOLS2, true> : flash_attn_rdna35<D, NCOLS2, false>;
-    kernel<<<grid, dim3(cfg<D>::NTHR, 1, 1), 0, stream>>>(
+    auto * kernel = q8_direct ? flash_attn_rdna35<DKQ, DV, NCOLS2, true> : flash_attn_rdna35<DKQ, DV, NCOLS2, false>;
+    kernel<<<grid, dim3(cfg<DKQ, DV>::NTHR, 1, 1), 0, stream>>>(
         (const char *) Q->data, K_data, V_data,
         mask ? (const char *) mask->data : nullptr, mask_cls_ptr, kv_max_ptr, (float *) dst->data, parts.ptr, meta.ptr,
         dst->src[4] ? (const float *) dst->src[4]->data : nullptr,
@@ -1096,30 +1126,59 @@ static void launch_fattn_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     if (nsplit > 1) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
-            dim3(Q->ne[1], Q->ne[2], Q->ne[3]), dim3(D, 1, 1), nsplit*sizeof(float2), stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<D>, launch_params, parts.ptr, meta.ptr, (float *) dst->data, nsplit);
+            dim3(Q->ne[1], Q->ne[2], Q->ne[3]), dim3(DV, 1, 1), nsplit*sizeof(float2), stream);
+        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params, parts.ptr, meta.ptr, (float *) dst->data, nsplit);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
-template <int D>
+template <int DKQ, int DV = DKQ>
 static void launch_fattn_rdna35_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int gqa_ratio = dst->src[0]->ne[2] / dst->src[1]->ne[2];
     // small batches of GQA 6 models: all 6 Q heads of a K/V head in one block, so that every K/V row is read once
     // (60 of 64 columns); prefill keeps 2 heads x 32 tokens
     if (gqa_ratio % 6 == 0 && dst->src[0]->ne[1] <= 32) {
-        launch_fattn_rdna35<D, 6>(ctx, dst);
+        launch_fattn_rdna35<DKQ, DV, 6>(ctx, dst);
         return;
     }
+    if constexpr (DV != DKQ) {
+        if (dst->src[0]->ne[1] <= 12) {
+            // absorbed MLA (MQA) small batches: one block takes all Q heads of the single K/V head, so every cache
+            // row is read once; prefill uses the pow2 grouping below (8 tokens x 4 heads)
+            // largest supported grouping that fits a block and divides the GQA ratio, so a block never straddles K/V heads
+            int n2 = 1;
+            for (const int c : {32, 20, 16, 8, 4, 2}) {
+                if (c <= fattn_rdna35::cfg<DKQ, DV>::NCOLS && gqa_ratio % c == 0) {
+                    n2 = c;
+                    break;
+                }
+            }
+            GGML_ASSERT(gqa_ratio % n2 == 0 && "unexpected MLA head grouping");
+            switch (n2) {
+                case 2:  launch_fattn_rdna35<DKQ, DV,  2>(ctx, dst); break;
+                case 4:  launch_fattn_rdna35<DKQ, DV,  4>(ctx, dst); break;
+                case 8:  launch_fattn_rdna35<DKQ, DV,  8>(ctx, dst); break;
+                case 16: launch_fattn_rdna35<DKQ, DV, 16>(ctx, dst); break;
+                case 20: launch_fattn_rdna35<DKQ, DV, 20>(ctx, dst); break;
+                case 32: launch_fattn_rdna35<DKQ, DV, 32>(ctx, dst); break;
+                default: launch_fattn_rdna35<DKQ, DV,  1>(ctx, dst); break;
+            }
+            return;
+        }
+    }
     switch (fattn_rdna35_ncols2(gqa_ratio)) {
-        case 8:  launch_fattn_rdna35<D, 8>(ctx, dst); break;
-        case 4:  launch_fattn_rdna35<D, 4>(ctx, dst); break;
-        case 2:  launch_fattn_rdna35<D, 2>(ctx, dst); break;
-        default: launch_fattn_rdna35<D, 1>(ctx, dst); break;
+        case 8:  launch_fattn_rdna35<DKQ, DV, 8>(ctx, dst); break;
+        case 4:  launch_fattn_rdna35<DKQ, DV, 4>(ctx, dst); break;
+        case 2:  launch_fattn_rdna35<DKQ, DV, 2>(ctx, dst); break;
+        default: launch_fattn_rdna35<DKQ, DV, 1>(ctx, dst); break;
     }
 }
 
 void ggml_cuda_flash_attn_ext_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->src[2]->ne[0] != dst->src[0]->ne[0]) { // MLA absorbed: V is a strided view of the K cache rows
+        launch_fattn_rdna35_ncols2<576, 512>(ctx, dst);
+        return;
+    }
     switch (dst->src[0]->ne[0]) {
         case 64:  launch_fattn_rdna35_ncols2< 64>(ctx, dst); break;
         case 128: launch_fattn_rdna35_ncols2<128>(ctx, dst); break;
