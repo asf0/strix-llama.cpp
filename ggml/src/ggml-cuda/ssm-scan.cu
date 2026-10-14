@@ -362,7 +362,6 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-#if !defined(GGML_USE_HIP)
 // ============================================================================
 // SSD (State Space Duality) kernels for Mamba-2 prefill (n_tok > SSM_SSD_MIN_TOKENS)
 //
@@ -492,11 +491,23 @@ __global__ void ssm_ssd_pre_matmul_kernel(
     const float cs_base = (chunk_offset > 0) ? cs[cs_seq_off + (chunk_offset - 1) * n_head + h] : 0.0f;
     const float cs_last = cs[cs_seq_off + (chunk_offset + chunk_len - 1) * n_head + h] - cs_base;
 
+    // Relative cumulative sums of the chunk in shared memory: the per (t_in, t_out) loads of the M
+    // materialization were strided by n_head (a 32 B sector for 4 B used each). Staged once per block.
+    __shared__ float cs_sh[SSM_SSD_CHUNK_SIZE];
+    for (int i = threadIdx.x; i < chunk_len; i += BLOCK_SIZE) {
+        cs_sh[i] = cs[cs_seq_off + (chunk_offset + i) * n_head + h] - cs_base;
+    }
+    __syncthreads();
+
+    // Grid-strided, 16 elements per thread: one element per thread (16384 tiny blocks at chunk 256) measured
+    // 288 us per call on gfx1151, and the dequant/LDS-bound sections do not need a thread per element.
+    const int vstride = gridDim.x * BLOCK_SIZE;
+
     // Prepare X_dt = x * dt, stored d-fastest for coalesced reads and writes.
     const int n_xdt = chunk_len * head_dim;
-    if (idx < n_xdt) {
-        const int d = idx % head_dim;
-        const int t = idx / head_dim;
+    for (int i = idx; i < n_xdt; i += vstride) {
+        const int d = i % head_dim;
+        const int t = i / head_dim;
 
         const float x_val = x[s * x_stride_seq + (chunk_offset + t) * x_stride_tok + d + h * head_dim];
         const float dt_val = dt_sp[cs_seq_off + (chunk_offset + t) * n_head + h];
@@ -507,11 +518,11 @@ __global__ void ssm_ssd_pre_matmul_kernel(
     // Prepare B_weighted and C_scaled together: both share the same index space (d_state * chunk_len)
     // and the same cs_t load, so merging halves the cs[] global memory traffic.
     const int n_bw = d_state * chunk_len;
-    if (idx < n_bw) {
-        const int n = idx % d_state;
-        const int t = idx / d_state;
+    for (int i = idx; i < n_bw; i += vstride) {
+        const int n = i % d_state;
+        const int t = i / d_state;
 
-        const float cs_t = cs[cs_seq_off + (chunk_offset + t) * n_head + h] - cs_base;
+        const float cs_t = cs_sh[t];
 
         const float B_val = B[s * B_stride_seq + (chunk_offset + t) * B_stride_tok + g * d_state + n];
         B_weighted[n + t * d_state + h * n_bw + s * n_bw * n_head] = (T_matmul)(B_val * __expf(A_h * (cs_last - cs_t)));
@@ -522,14 +533,14 @@ __global__ void ssm_ssd_pre_matmul_kernel(
 
     // Materialize M = exp(A*(cs_out - cs_in)) * CB with causal mask.
     const int n_M = chunk_len * chunk_len;
-    if (idx < n_M) {
-        const int t_out = idx % chunk_len;
-        const int t_in  = idx / chunk_len;
+    for (int i = idx; i < n_M; i += vstride) {
+        const int t_out = i % chunk_len;
+        const int t_in  = i / chunk_len;
 
         half val;
         if (t_in <= t_out) {
-            const float cs_out = cs[cs_seq_off + (chunk_offset + t_out) * n_head + h] - cs_base;
-            const float cs_in  = cs[cs_seq_off + (chunk_offset + t_in)  * n_head + h] - cs_base;
+            const float cs_out = cs_sh[t_out];
+            const float cs_in  = cs_sh[t_in];
             const float decay  = __expf(A_h * (cs_out - cs_in));
             const float * CB_g = CB + (int64_t)s * chunk_len * chunk_len * n_group
                                    + (int64_t)g * chunk_len * chunk_len;
@@ -701,7 +712,7 @@ static void ssm_scan_ssd_f32_cuda(
             int64_t max_work = n_xdt;
             if (n_bw  > max_work) max_work = n_bw;
             if (n_M   > max_work) max_work = n_M;
-            dim3 grid((max_work + BLOCK - 1) / BLOCK, n_head, n_seq);
+            dim3 grid((max_work + 16*BLOCK - 1) / (16*BLOCK), n_head, n_seq);
             ssm_ssd_pre_matmul_kernel<BLOCK, matmul_t><<<grid, BLOCK, 0, stream>>>(
                 cs, dt_sp, src3_d, src1_d, src4_d, src5_d,
                 X_dt, B_weighted, C_scaled,
@@ -783,7 +794,6 @@ static void ssm_scan_ssd_f32_cuda(
         }
     }
 }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                        const ggml_cuda_ssm_scan_fused_cache * cache) {
@@ -843,17 +853,20 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
     GGML_ASSERT(src5->nb[2] <= (size_t)INT_MAX);
     GGML_ASSERT(src5->nb[3] <= (size_t)INT_MAX);
 
-#if !defined(GGML_USE_HIP)
-    // Mamba-2 with scalar A per head: use SSD matmul path for long sequences.
-    // Requires NVIDIA Turing+ otherwise fallback to scan.
+    // Mamba-2 with scalar A per head: SSD matmul path for long sequences, scan otherwise. NVIDIA
+    // Turing+ and RDNA3.5 (gfx1151: pp4096 +18% at d0, +10% at d64k on Nemotron-3.5) use it by
+    // default; GGML_SSM_SSD: -1 platform default, 0 off, 1 on. cuBLAS and hipBLAS both need
+    // 8-element (16-byte) alignment.
     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const int ssd_env = getenv("GGML_SSM_SSD") ? atoi(getenv("GGML_SSM_SSD")) : -1;
+    const bool hw_ssd = (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) || GGML_CUDA_CC_IS_RDNA3_5(cc);
+    const bool cc_ssd = ssd_env < 0 ? hw_ssd : (ssd_env > 0 && hw_ssd);
     const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
                       && K == 1
                       && n_t <= SSM_SSD_MAX_TOKENS
-                      && GGML_CUDA_CC_IS_NVIDIA(cc)
-                      && cc >= GGML_CUDA_CC_TURING
-                      && nr % 8 == 0;  // cuBLAS requires 8-element (16-byte) alignment
+                      && cc_ssd
+                      && nr % 8 == 0;
 
     if (use_ssd) {
         // ssm_ssd_init_state_kernel uses flat linear indexing within each sequence,
@@ -873,7 +886,6 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
             cache ? cache->data : (float *) ((char *) dst_d + s_off), nc, nr, nh, ng, n_t, n_s);
         return;
     }
-#endif
     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
