@@ -4968,6 +4968,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Nemotron-H expert MLP (up -> relu(x)^2): fold the activation into the routed GEMM epilogue, otherwise a
+    // later pattern in this function consumes the MUL_MAT_ID first. Same math as unary_cuda<op_relu_sqr>, so the
+    // outputs stay bit-identical. MMB_DBG_FUSE=1 prints the decision.
+    // Nemotron-H expert MLP (up -> relu(x)^2): fold the activation into the routed GEMM epilogue, so the
+    // activation kernel and its f32 round trip disappear. ggml_can_fuse_subgraph rejects this pattern for a
+    // reason that is not visible from here, so the two safety conditions are checked by hand: the up result is
+    // consumed only by the relu, and the relu result only by the sqr. Same per-element math as
+    // unary_cuda<op_relu_sqr>. MMB_DBG_FUSE=1 prints the decision.
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * relu = cgraph->nodes[i + 1];
+        ggml_tensor * sqr        = cgraph->nodes[i + 2];
+        if (relu->op == GGML_OP_UNARY && relu->src[0] == node && sqr->op == GGML_OP_SQR && sqr->src[0] == relu &&
+            ggml_get_unary_op(relu) == GGML_UNARY_OP_RELU) {
+            int users_up = 0, users_relu = 0;
+            for (int n = 0; n < cgraph->n_nodes; ++n) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    users_up   += t->src[j] == node;
+                    users_relu += t->src[j] == relu;
+                }
+            }
+            const bool ok = users_up == 1 && users_relu == 1 &&
+                ggml_cuda_mmb_supported_mmid(*cuda_ctx, node->src[0], node->src[1], node->src[2], sqr);
+            static const bool dbg = getenv("MMB_DBG_FUSE") != nullptr;
+            if (dbg) fprintf(stderr, "[mmb-fuse] %d users up=%d relu=%d mmb=%d\n", i, users_up, users_relu, (int) ok);
+            if (ok) {
+                ggml_cuda_mul_mat_id_mmb(*cuda_ctx, node->src[0], node->src[1], node->src[2], sqr, 1);
+                return 2;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_idx_relu_sum_args args;
         const int count = ggml_cuda_match_idx_gemm(*cuda_ctx, cgraph, i, args);

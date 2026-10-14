@@ -12,7 +12,8 @@ bool ggml_cuda_mmb_idx_score_supported(ggml_backend_cuda_context & ctx, const gg
         const ggml_tensor * mm, int heads);
 void ggml_cuda_mmb_idx_score(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const int32_t * tails, const int32_t * starts);
-void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+// act != 0: fold relu(x)^2 (Nemotron-H expert activation) into the epilogue
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const int act = 0);
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx);
 // producers that can emit a BF16 copy of an F32 output register it here; returns the BF16 buffer to fill (n elements)
 uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
