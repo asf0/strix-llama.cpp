@@ -69,6 +69,11 @@ struct cfg {
     // once, the loop spilled and its scratch reloads waited for the K/V loads (vmcnt is in order): 26.7 TFLOPS. Loading V
     // after the first barrier, one score chain and P one operand at a time: 29.5. At D = 256 both cost ~1%.
     static constexpr bool TIGHT = DV >= 512;
+    // Fewer VGPRs can only be reached that way (live state in the source): on gfx1151 with the ROCm core-10.0 toolchain
+    // neither the __launch_bounds__ minimum-waves argument nor __attribute__((amdgpu_waves_per_eu)) drives the register
+    // budget (standalone check: same 256-float kernel, same num_vgpr with and without a 4-waves/EU cap). The q8_0 decode
+    // path at D <= 128 runs 256 VGPRs = 8 waves per CU and is latency-bound there: more split blocks help a little
+    // (LFM2.5, 64k keys: 532 -> 470 us per call at 240 blocks), fewer live columns are the real lever.
     // D = 256: warp dq of a column tile finishes key tile dq of the step (half the score exchange and softmax per warp).
     static constexpr bool OWN   = KT == DQ;
     static constexpr int SQK    = DKQ + 8;              // row stride (halves) of sK:     conflict-free 16-row reads
@@ -907,12 +912,16 @@ static void fattn_rdna35_to_f16(const ggml_tensor * t, half * dst_f16, int64_t *
 
 // q8_0 K and V of a small batch are read and dequantized by the kernel, which is bound by the K/V reads there.
 // Prefill is bound by the WMMAs and converts them to f16 first (the dequantization would cost more than that).
+// D = 64 single-token batches stay on the generic tile kernel: this kernel holds 256 VGPRs (8 waves per CU),
+// and at that occupancy the q8 staging does not hide the read latency (LFM2.5 24B-A2B, 64k keys, gfx1151:
+// 532 us per call against 471 us for flash_attn_tile; D = 128 keeps ~2x on this kernel, see the launcher note).
 static bool fattn_rdna35_q8_direct(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     auto aligned4 = [](const ggml_tensor * t) { return t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0 && t->nb[3] % 4 == 0; };
-    return Q->ne[1]*fattn_rdna35_ncols2(Q->ne[2] / K->ne[2]) < 256 &&
+    return (Q->ne[0] != 64 || Q->ne[1] > 1) &&
+        Q->ne[1]*fattn_rdna35_ncols2(Q->ne[2] / K->ne[2]) < 256 &&
         K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && aligned4(K) && aligned4(V);
 }
 
@@ -976,7 +985,9 @@ bool ggml_cuda_flash_attn_ext_rdna35_supported(const int device, const ggml_tens
     // 8 tokens, f16 / q8_0: Qwen3.6 35B-A3B 577 / 865 -> 330 / 188 us, Qwen3.8 27B 1635 / 2750 -> 597 / 385 us.
     // Single-token f16 decode stays on the tile kernel (279 vs 325 us); below 4k keys the generic kernels are as fast.
     const bool f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
-    return K->ne[1] >= 4096 && ((f16 && Q->ne[1] >= 2) || fattn_rdna35_q8_direct(dst));
+    // MQA decode (MLA): one block streams the whole cache once for all Q heads, unlike the GQA case where the
+    // tile kernel's re-reads are as cheap as the split
+    return K->ne[1] >= 4096 && ((f16 && (Q->ne[1] >= 2 || DV != DKQ)) || fattn_rdna35_q8_direct(dst));
 }
 
 template <int DKQ, int DV, int NCOLS2>
@@ -1132,6 +1143,12 @@ static void launch_fattn_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * d
 template <int DKQ, int DV = DKQ>
 static void launch_fattn_rdna35_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int gqa_ratio = dst->src[0]->ne[2] / dst->src[1]->ne[2];
+    // GQA 16 small batches (decode, speculative verification): the 8-head grouping reads every K/V row twice,
+    // all 16 Q heads of a K/V head fit one block. Batches of 16+ tokens keep the 8-head grouping (prefill path).
+    if (gqa_ratio % 16 == 0 && dst->src[0]->ne[1]*16 < 256) {
+        launch_fattn_rdna35<DKQ, DV, 16>(ctx, dst);
+        return;
+    }
     // small batches of GQA 6 models: all 6 Q heads of a K/V head in one block, so that every K/V row is read once
     // (60 of 64 columns); prefill keeps 2 heads x 32 tokens
     if (gqa_ratio % 6 == 0 && dst->src[0]->ne[1] <= 32) {
