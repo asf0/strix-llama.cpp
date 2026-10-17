@@ -1080,7 +1080,14 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
 }
 void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb) ctx.mmb->bf16_only.clear(); }
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb ? ctx.mmb->bf16_only.size() : 0; }
-void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { mmb_state(ctx).bf16_only.insert(t); }
+// BF16-only marks (tensors without an F32 copy) are read only through fused paths: an unfused reader aborts. So no marks
+// when fusion is disabled or restricted to a node range by the bisection knobs in ggml_cuda_try_fuse.
+static bool mmb_bf16_marks_allowed() {
+    static const bool v = !(getenv("GGML_CUDA_DISABLE_FUSION") && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0) &&
+                          !getenv("GGML_CUDA_FUSE_MIN_NODE") && !getenv("GGML_CUDA_FUSE_MAX_NODE");
+    return v;
+}
+void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { if (mmb_bf16_marks_allowed()) mmb_state(ctx).bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb && ctx.mmb->bf16_only.count(t) > 0; }
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     if (!ctx.mmb) return;
