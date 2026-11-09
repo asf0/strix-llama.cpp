@@ -13,6 +13,7 @@
 #include <map>
 #include <thread>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1867,7 +1868,11 @@ skip:
             for (int t = 1; t < n_thr; ++t) {
                 const size_t r0 = std::min(rest.size(), t*per), r1 = std::min(rest.size(), (t + 1)*per);
                 if (r0 < r1) {
-                    workers.emplace_back(fill_rest, r0, r1);
+                    try {
+                        workers.emplace_back(fill_rest, r0, r1);
+                    } catch (const std::system_error &) {
+                        fill_rest(r0, r1); // could not start a thread: fill this range here
+                    }
                 }
             }
             fill_rest(0, std::min(rest.size(), per));
