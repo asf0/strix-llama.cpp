@@ -1746,9 +1746,16 @@ int ggml_cuda_mmb_f16_marks(ggml_backend_cuda_context & ctx, const ggml_tensor *
     return it == ctx.mmb->f16_marks.end() ? 0 : it->second;
 }
 size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx) { return ctx.mmb ? ctx.mmb->bf16_only.size() : 0; }
+// BF16-only marks (tensors without an F32 copy) are read only through fused paths: an unfused reader aborts. So no marks
+// at any mark site when fusion is disabled (GGML_CUDA_DISABLE_FUSION, the same test as ggml_cuda_fusion_disabled).
+static bool mmb_bf16_marks_allowed() {
+    static const bool v = !(getenv("GGML_CUDA_DISABLE_FUSION") && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0);
+    return v;
+}
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
     // a graph output is read by the host after the graph (embeddings, MTP hidden state): it keeps its F32 store
     if (t->flags & GGML_TENSOR_FLAG_OUTPUT) return;
+    if (!mmb_bf16_marks_allowed()) return;
     mmb_state(ctx).bf16_only.insert(t);
 }
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t) { return ctx.mmb && ctx.mmb->bf16_only.count(t) > 0; }
